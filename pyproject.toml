@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "pyrockfall"
+version = "0.1.0"
+description = "Open-source vectorised framework for stochastic rockfall simulation"
+readme = "README.md"
+requires-python = ">=3.10"
+
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+
+authors = [
+  { name = "Guilherme Barros", email = "guilherme.barros@newcastle.edu.au" }
+]
+
+maintainers = [
+  { name = "Guilherme Barros", email = "guilherme.barros@newcastle.edu.au" }
+]
+
+keywords = [
+  "rockfall",
+  "geomechanics",
+  "simulation",
+  "stochastic",
+  "monte-carlo",
+  "vectorised",
+  "open-pit",
+  "rockfall-hazard"
+]
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Physics",
+  "Topic :: Scientific/Engineering :: GIS"
+]
+
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "pandas>=1.5",
+  "matplotlib>=3.7",
+  "seaborn>=0.13",
+  "scikit-learn>=1.2",
+  "plyfile>=0.9",
+  "open3d>=0.17",
+  "tensorflow>=2.20",
+  "xgboost>=3.2",
+]
+
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "ipdb",
+  "black",
+  "ruff",
+  "mypy",
+  "build",
+  "twine",
+  "rich"
+]
+
+
+[project.urls]
+Homepage = "https://github.com/gbarros92/PyRockfall"
+Repository = "https://github.com/gbarros92/PyRockfall"
+Issues = "https://github.com/gbarros92/PyRockfall/issues"
+Documentation = "https://github.com/gbarros92/PyRockfall/tree/main/docs"
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pyrockfall*"]
+namespaces = false
+
+
+[tool.setuptools.package-data]
+pyrockfall = [
+  "**/*.csv",
+  "**/*.json",
+  "**/*.yaml",
+  "**/*.yml",
+  "**/*.joblib",
+  "**/*.keras"
+]
