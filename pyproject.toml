@@ -57,6 +57,9 @@ dependencies = [
 
 
 [project.optional-dependencies]
+docs = [
+  "sphinx>=7.0",
+]
 dev = [
   "pytest",
   "ipdb",
