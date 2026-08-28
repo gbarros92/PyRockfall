@@ -727,10 +727,13 @@ def _materialProperties(materials: List[Material], colors: List[tuple[int, int, 
     materials_props = []
     for id, mat in enumerate(materials):
         name  = mat.name
-        if colors is None:
-            rgb = (np.random.randint(0,255), np.random.randint(0,255), np.random.randint(0,255))
-        else:
+        if colors is not None:
             rgb = colors[id]
+        elif mat.color is not None:
+            rgb = mat.color
+        else:
+            rgb = (np.random.randint(0,255), np.random.randint(0,255), np.random.randint(0,255))
+            mat.color = rgb
         mat_prop = {
             'name': name,
             'id': id,
@@ -763,9 +766,8 @@ def _materialProperties(materials: List[Material], colors: List[tuple[int, int, 
     return materials_props
 
 
-def _properties_to_materials(materials: List[Mapping[str, Any]]) -> Tuple[List[Material], List[Tuple[int, int, int]]]:
+def _properties_to_materials(materials: List[Mapping[str, Any]]) -> List[Material]:
     material_objects = []
-    colors = []
     for mat in materials:
         name  = mat['name']
         normal_rest = stats.makeDistribution(
@@ -804,8 +806,6 @@ def _properties_to_materials(materials: List[Mapping[str, Any]]) -> Tuple[List[M
                 rel_max=mat['slope_roughness'][4],
             )
         )
-        colour = mat['color']
-        colors.append(colour)
         material_objects.append(
             Material(
                 name=name,
@@ -813,9 +813,10 @@ def _properties_to_materials(materials: List[Mapping[str, Any]]) -> Tuple[List[M
                 tangentialRestitution=tangential_rest,
                 frictionAngle=friction_angle,
                 roughness=slope_roughness,
+                color=mat['color'],
             )
         )
-    return material_objects, colors
+    return material_objects
 
 
 def _writeMaterials_fal8(filepath: str, materials: List[Mapping[str, Any]]):
@@ -908,7 +909,7 @@ def exportMaterials(filepath: str, materials: List[Material], colors: List[Tuple
     _writeMaterials_fal8(filepath, materials_props)
 
 
-def importMaterials(filepath: str) -> Tuple[List[Material], List[Tuple[int, int, int]]]:
+def importMaterials(filepath: str) -> List[Material]:
     return _properties_to_materials(_readMaterials_fal8(filepath))
 
 
@@ -917,10 +918,13 @@ def _rocksProperties(rock_types: List[Rock], colors: List[tuple[int, int, int]] 
     for id, rock in enumerate(rock_types):
         density = exportDistribution(rock.density)
         mass = exportDistribution(rock.mass)
-        if colors is None:
-            rgb = (np.random.randint(0,255), np.random.randint(0,255), np.random.randint(0,255))
-        else:
+        if colors is not None:
             rgb = colors[id]
+        elif rock.color is not None:
+            rgb = rock.color
+        else:
+            rgb = (np.random.randint(0,255), np.random.randint(0,255), np.random.randint(0,255))
+            rock.color = rgb
         rocks_props.append({
             'name': rock.name,
             'id': id,
@@ -933,9 +937,8 @@ def _rocksProperties(rock_types: List[Rock], colors: List[tuple[int, int, int]] 
     return rocks_props
 
 
-def _properties_to_rocks(rocks: List[Mapping[str, Any]]) -> Tuple[List[Rock], List[Tuple[int, int, int]]]:
+def _properties_to_rocks(rocks: List[Mapping[str, Any]]) -> List[Rock]:
     rocks_objects = []
-    colors = []
     for rock in rocks:
         name = rock['name']
         density = stats.makeDistribution(
@@ -960,11 +963,11 @@ def _properties_to_rocks(rocks: List[Mapping[str, Any]]) -> Tuple[List[Rock], Li
             Rock(
                 name=name,
                 density=density,
-                mass=mass
+                mass=mass,
+                color=rock['color'],
             )
         )
-        colors.append(rock['color'])
-    return rocks_objects, colors
+    return rocks_objects
 
 
 def _writeRocks_fal8(filepath: str, rocks: List[Mapping[str, Any]]):
@@ -1036,7 +1039,7 @@ def exportRocks(filepath: str, rocks: List[Rock], colors: List[tuple[int, int, i
     _writeRocks_fal8(filepath, rocks_props)
 
 
-def importRocks(filepath: str) -> Tuple[List[Rock], List[Tuple[int, int, int]]]:
+def importRocks(filepath: str) -> List[Rock]:
     return _properties_to_rocks(_readRocks_fal8(filepath))
 
 
