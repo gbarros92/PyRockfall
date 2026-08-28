@@ -105,6 +105,7 @@ Scripts subpackage
 
    scripts/create
    scripts/extract
+   scripts/section
    scripts/_data
    scripts/_style
 

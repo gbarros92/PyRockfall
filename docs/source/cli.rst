@@ -6,7 +6,7 @@ wrapper around the entry scripts in :mod:`pyrockfall.scripts`:
 
 .. code-block:: bash
 
-   pyrockfall {create,extract} ...
+   pyrockfall {create,extract,section} ...
 
 ``pyrockfall create``
 ----------------------
@@ -75,6 +75,42 @@ for use as input to ``pyrockfall create``.
    * - ``--save-segments``
      - Save segments: ``yes``, ``no``, or ``aligned``. Default: ``no``.
 
-Both subcommands are also runnable programmatically via
-``main_from_namespace`` -- see :mod:`pyrockfall.scripts.create` and
-:mod:`pyrockfall.scripts.extract`.
+``pyrockfall section``
+------------------------
+
+Extract representative 2D profiles from a 3D point cloud by tracing
+sections along strike (:meth:`pyrockfall.PointCloud.section`), for use as
+input to ``pyrockfall create``. Unlike ``pyrockfall extract``, this does not
+require segmenting or pre-aligning the model: the section-tracing handles
+curved or non-planar walls directly.
+
+.. code-block:: bash
+
+   pyrockfall section model.ply [options]
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Argument
+     - Description
+   * - ``filename``
+     - Input point cloud file (``.ply`` with material attributes).
+   * - ``-S``, ``--profile-spacing``
+     - Spacing between profiles/sections, in metres. Default: ``1.0``.
+   * - ``-n``, ``--material-name``
+     - Attribute name for material IDs in the point cloud. Default: ``Material``.
+   * - ``-r``, ``--transverse-radius``
+     - Half-width of the strip used to assign points to each section, in
+       metres. Defaults to half the point cloud's vertical extent.
+   * - ``--min-points``
+     - Minimum number of points required for a section to be valid. Default: ``20``.
+   * - ``--max-turn-angle``
+     - Maximum change in marching direction between consecutive nodes, in
+       degrees. Default: ``45.0``.
+   * - ``--save-profiles``
+     - Save profiles: ``yes`` (combined), ``no``, or ``separate``. Default: ``yes``.
+
+All subcommands are also runnable programmatically via
+``main_from_namespace`` -- see :mod:`pyrockfall.scripts.create`,
+:mod:`pyrockfall.scripts.extract`, and :mod:`pyrockfall.scripts.section`.
