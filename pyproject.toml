@@ -69,6 +69,10 @@ dev = [
 ]
 
 
+[project.scripts]
+pyrockfall = "pyrockfall.cli:main"
+
+
 [project.urls]
 Homepage = "https://github.com/gbarros92/PyRockfall"
 Repository = "https://github.com/gbarros92/PyRockfall"
