@@ -43,6 +43,8 @@ from pyrockfall._functionalities import (
     findClosest,
     extrudePolyline,
     grid2mesh,
+    mesh2PointCloud,
+    pointCloud2Mesh,
     slopeBelow,
     materialLayers,
     interpPercentiles,
@@ -242,6 +244,75 @@ def test_grid2mesh_triangle_area_matches_cell_size():
         e2 = c - a
         total_area += 0.5 * abs(e1[0] * e2[1] - e1[1] * e2[0])
     assert total_area == pytest.approx(2.0 * 3.0)
+
+
+# ---------------------------------------------------------------------------
+# mesh2PointCloud / pointCloud2Mesh
+# ---------------------------------------------------------------------------
+
+def strip_mesh():
+    """Two quads (four triangles) forming a 2x1 flat strip along x in [0,2]."""
+    pts = np.array([
+        [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0],
+    ])
+    tris = np.array([
+        [0, 1, 4], [0, 4, 3],  # quad0: x in [0,1]
+        [1, 2, 5], [1, 5, 4],  # quad1: x in [1,2]
+    ])
+    return pts, tris
+
+
+def flat_grid_points():
+    """3x2 grid of points on the z=0 plane."""
+    xs, ys = np.meshgrid(np.arange(3.0), np.arange(2.0))
+    return np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)])
+
+
+def test_mesh2_point_cloud_keeps_points_and_node_attrs():
+    pts, tris = strip_mesh()
+    m = pr.Mesh(points=pts, triangles=tris)
+    m.set_attr("elevation", pts[:, 2].copy())        # per-node (N=6)
+    m.set_attr("slope", np.arange(tris.shape[0]))    # per-triangle (E=4)
+
+    pc = mesh2PointCloud(m)
+
+    assert isinstance(pc, pr.PointCloud)
+    np.testing.assert_array_equal(pc.points, pts)
+    np.testing.assert_array_equal(pc.get_attr("elevation"), pts[:, 2])
+    assert not pc.has_attr("slope")
+
+
+def test_mesh2_point_cloud_with_no_extra_attrs():
+    pts, tris = strip_mesh()
+    m = pr.Mesh(points=pts, triangles=tris)
+    pc = mesh2PointCloud(m)
+    np.testing.assert_array_equal(pc.points, pts)
+    assert pc.list_attrs() == []
+
+
+def test_point_cloud2_mesh_triangulates_flat_grid():
+    pts = flat_grid_points()
+    pc = pr.PointCloud(points=pts, attrs={"elevation": pts[:, 2].copy()})
+
+    m = pointCloud2Mesh(pc)
+
+    assert isinstance(m, pr.Mesh)
+    np.testing.assert_array_equal(m.points, pts)
+    assert m.triangles.ndim == 2 and m.triangles.shape[1] == 3
+    assert m.triangles.shape[0] > 0
+    assert m.triangles.min() >= 0
+    assert m.triangles.max() < pts.shape[0]
+    np.testing.assert_array_equal(m.get_attr("elevation"), pts[:, 2])
+
+
+def test_mesh_to_point_cloud_to_mesh_roundtrip_preserves_points():
+    pts, tris = strip_mesh()
+    m = pr.Mesh(points=pts, triangles=tris)
+
+    m2 = pointCloud2Mesh(mesh2PointCloud(m))
+
+    np.testing.assert_array_equal(m2.points, m.points)
 
 
 # ---------------------------------------------------------------------------
