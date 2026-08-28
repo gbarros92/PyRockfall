@@ -5,6 +5,7 @@ User functionalities in pyrockfall
 This module implements functions to facilitate rockfall simulation.
 """
 import numpy as np
+from scipy.spatial import Delaunay
 from numpy.typing import NDArray
 from typing import Union, List, Tuple, Optional, Callable, Literal, Dict, Any
 
@@ -16,6 +17,7 @@ from ._seeder import Seeder
 from ._model import Model
 from ._pointcloud import PointCloud
 from ._mesh import Mesh
+
 
 def singleMaterialSlope(slope: Slope, material: Union[Material, int]) -> List[Slope]:
     """Create a list of slopes, each containing only a single material from the original slope.
@@ -301,11 +303,15 @@ def pointCloud2Mesh(pc: PointCloud) -> Mesh:
     """Build a :class:`Mesh` from a point cloud via automatic Delaunay
     triangulation.
 
-    The point cloud is rotated so its best-fit plane normal aligns with the
-    X axis, and a 2D Delaunay triangulation is run on the remaining (Y, Z)
-    coordinates. The resulting triangle connectivity is then attached to the
-    original (un-rotated) points. All per-point attributes are carried over
-    onto the mesh as per-node attributes.
+    A working copy of the point cloud is levelled using its own orientation
+    utilities: :meth:`PointCloud.alignWithX` rotates it so the fitted
+    plane's strike aligns with X, then rotating by :meth:`PointCloud.dip`
+    around the X axis flattens the plane into the XY plane (leaving only
+    small residual variation on Z, i.e. local relief). A 2D Delaunay
+    triangulation is run on the levelled (X, Y) coordinates. The resulting
+    triangle connectivity is then attached to the original (untouched)
+    points. All per-point attributes are carried over onto the mesh as
+    per-node attributes.
 
     Parameters
     ----------
@@ -318,17 +324,11 @@ def pointCloud2Mesh(pc: PointCloud) -> Mesh:
         A new mesh with the point cloud's nodes, automatically triangulated
         connectivity, and per-node attributes.
     """
-    from scipy.spatial import Delaunay
-
-    from ._utils import rotationAlign2x
-
-    pts = pc.points
-    normal = pc.normalVector()
-    R = rotationAlign2x(normal)
-    centre = pts.mean(axis=0, keepdims=True)
-    rotated = (pts - centre) @ R.T
-    tri = Delaunay(rotated[:, 0::2])  # (X, Z) plane
-    return Mesh(pts.copy(), tri.simplices.astype(np.int32), attrs=dict(pc.attrs))
+    levelled = PointCloud(pc.points.copy())
+    levelled.alignWithX()
+    levelled.rotate(-levelled.dip(), axis="x")
+    tri = Delaunay(levelled.points[:, :2])  # (X, Y) plane
+    return Mesh(pc.points.copy(), tri.simplices.astype(np.int32), attrs=dict(pc.attrs))
 
 def slopeBelow(slope: Slope, seeder: Seeder) -> Slope:
     """

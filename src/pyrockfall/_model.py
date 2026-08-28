@@ -534,12 +534,14 @@ class Model(ABC):
         # Fit plane and get its unit normal
         n = self.normalVector()
         direction = np.array([-n[1], n[0], 0.0])
-        direction /= np.linalg.norm(direction)
-        direction *= float(sense)
+        norm = np.linalg.norm(direction)
+        if norm > 1e-12:
+            direction /= norm
+            direction *= float(sense)
 
-        R = rotationAlign2x(direction)
+            R = rotationAlign2x(direction)
 
-        self.points = self.points @ R.T
+            self.points = self.points @ R.T
 
         # Restore original position
         self.translate(c)
