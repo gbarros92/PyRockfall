@@ -77,10 +77,10 @@ pyrockfall = "pyrockfall.cli:main"
 
 
 [project.urls]
-Homepage = "https://github.com/gbarros92/PyRockfall"
+Homepage = "https://gbarros92.github.io/PyRockfall/"
 Repository = "https://github.com/gbarros92/PyRockfall"
 Issues = "https://github.com/gbarros92/PyRockfall/issues"
-Documentation = "https://github.com/gbarros92/PyRockfall/tree/main/docs"
+Documentation = "https://gbarros92.github.io/PyRockfall/"
 
 
 [tool.setuptools.packages.find]
