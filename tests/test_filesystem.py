@@ -203,14 +203,15 @@ def test_export_materials_import_materials_roundtrip(tmp_path):
         frictionAngle=stats.Uniform(20.0, 40.0),
     )
     mat1 = pr.Material(name="Granite", normalRestitution=0.4, tangentialRestitution=0.6, frictionAngle=35.0)
-    colors = [(255, 0, 0), (0, 255, 0)]
+    mat0.color = (255, 0, 0)
+    mat1.color = (0, 255, 0)
 
     path = tmp_path / "materials.fal8"
-    pr.exportMaterials(str(path), [mat0, mat1], colors)
+    pr.exportMaterials(str(path), [mat0, mat1])
     assert path.exists()
 
-    loaded, loaded_colors = pr.importMaterials(str(path))
-    assert loaded_colors == colors
+    loaded = pr.importMaterials(str(path))
+    assert [m.color for m in loaded] == [mat0.color, mat1.color]
     assert [m.name for m in loaded] == ["Basalt", "Granite"]
 
     assert loaded[0].normalRestitution.mean() == pytest.approx(mat0.normalRestitution.mean(), rel=1e-5)
@@ -228,10 +229,10 @@ def test_export_materials_import_materials_roundtrip(tmp_path):
 def test_export_materials_import_materials_default_colors_are_generated(tmp_path):
     mat = pr.Material(name="M")
     path = tmp_path / "materials_nocolor.fal8"
-    pr.exportMaterials(str(path), [mat])  # colors=None -> random colors generated
-    loaded, loaded_colors = pr.importMaterials(str(path))
-    assert len(loaded_colors) == 1
-    r, g, b = loaded_colors[0]
+    pr.exportMaterials(str(path), [mat])  # color unset -> random color generated
+    loaded = pr.importMaterials(str(path))
+    assert len(loaded) == 1
+    r, g, b = loaded[0].color
     assert 0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255
 
 
@@ -244,7 +245,7 @@ def test_export_materials_import_materials_does_not_preserve_roughness(tmp_path)
     mat = pr.Material(name="M", roughness=stats.Normal(0.0, 0.05))
     path = tmp_path / "materials_roughness.fal8"
     pr.exportMaterials(str(path), [mat])
-    loaded, _ = pr.importMaterials(str(path))
+    loaded = pr.importMaterials(str(path))
     assert isinstance(loaded[0].roughness, stats.Deterministic)
     assert loaded[0].roughness.value == 0.0
 
@@ -256,14 +257,15 @@ def test_export_materials_import_materials_does_not_preserve_roughness(tmp_path)
 def test_export_rocks_import_rocks_roundtrip(tmp_path):
     rock0 = pr.Rock(name="Small", mass=stats.Normal(50.0, 5.0), density=stats.Uniform(2500.0, 2700.0))
     rock1 = pr.Rock(name="Big", mass=500.0, density=2600.0)
-    colors = [(1, 2, 3), (4, 5, 6)]
+    rock0.color = (1, 2, 3)
+    rock1.color = (4, 5, 6)
 
     path = tmp_path / "rocks.fal8"
-    pr.exportRocks(str(path), [rock0, rock1], colors)
+    pr.exportRocks(str(path), [rock0, rock1])
     assert path.exists()
 
-    loaded, loaded_colors = pr.importRocks(str(path))
-    assert loaded_colors == colors
+    loaded = pr.importRocks(str(path))
+    assert [r.color for r in loaded] == [rock0.color, rock1.color]
     assert [r.name for r in loaded] == ["Small", "Big"]
 
     assert loaded[0].mass.native_params() == pytest.approx(rock0.mass.native_params(), rel=1e-5)
