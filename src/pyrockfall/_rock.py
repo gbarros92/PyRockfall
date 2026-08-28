@@ -22,7 +22,7 @@ Use :func:`stats.asDistribution` to convert numeric inputs into deterministic
 distributions and to accept frozen SciPy distributions seamlessly.
 """
 
-from typing import List
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -51,7 +51,8 @@ class Rock:
 
     def __init__(self, name: str = '',
                  mass: stats.DistributionLike = 0.0,
-                 density: stats.DistributionLike = 0.0) -> None:
+                 density: stats.DistributionLike = 0.0,
+                 color: Optional[Tuple[int, int, int]] = None) -> None:
         """Initialize a new :class:`Rock`."""
         Rock._instance_count += 1
         self._name = name or f'Group {Rock._instance_count}'
@@ -59,6 +60,7 @@ class Rock:
         # Defaults are deterministic zeros; users should override as needed.
         self._mass: stats.Distribution = stats.asDistribution(mass)
         self._density: stats.Distribution = stats.asDistribution(density)
+        self._color: Optional[Tuple[int, int, int]] = color
 
     # ---------------------- Properties ----------------------
 
@@ -96,6 +98,15 @@ class Rock:
                 distribution.
         """
         self._density = stats.asDistribution(value)
+
+    @property
+    def color(self) -> Optional[Tuple[int, int, int]]:
+        """Optional RGB color for visualization/export."""
+        return self._color
+
+    @color.setter
+    def color(self, value: Optional[Tuple[int, int, int]]) -> None:
+        self._color = value
 
     @property
     def numRandomVariables(self) -> int:

@@ -24,7 +24,7 @@ Notes
 
 from __future__ import annotations
 
-from typing import Sequence, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -76,6 +76,7 @@ class Material:
             tangentialRestitution: stats.DistributionLike = 0.0,
             frictionAngle: stats.DistributionLike = 0.0,
             roughness: stats.DistributionLike = 0.0,
+            color: Optional[Tuple[int, int, int]] = None,
         ) -> None:
         """Initialise a :class:`Material`.
 
@@ -83,6 +84,8 @@ class Material:
 
         Args:
             name: Optional name for the material.
+            color: Optional RGB color (e.g. for visualization/export). Not a
+                stochastic parameter; stored as-is.
         """
         Material._instance_count += 1
         self._name: str = name or f"Material {Material._instance_count}"
@@ -92,6 +95,7 @@ class Material:
         self._tangentialRestitution: stats.Distribution = stats.asDistribution(tangentialRestitution)
         self._frictionAngle: stats.Distribution = stats.asDistribution(frictionAngle)
         self._roughness: stats.Distribution = stats.asDistribution(roughness)
+        self._color: Optional[Tuple[int, int, int]] = color
 
     # ----------------------------
     # Properties
@@ -148,6 +152,15 @@ class Material:
     @roughness.setter
     def roughness(self, value: stats.DistributionLike) -> None:
         self._roughness = stats.asDistribution(value)
+
+    @property
+    def color(self) -> Optional[Tuple[int, int, int]]:
+        """Optional RGB color for visualization/export."""
+        return self._color
+
+    @color.setter
+    def color(self, value: Optional[Tuple[int, int, int]]) -> None:
+        self._color = value
 
     @property
     def numRandomVariables(self) -> int:
