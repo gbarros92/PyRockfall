@@ -46,3 +46,7 @@ suppress_warnings = ["autodoc.duplicate"]
 
 html_theme = 'alabaster'
 html_static_path = ['_static']
+html_theme_options = {
+    'logo': 'logo.png',
+    'logo_name': True,
+}

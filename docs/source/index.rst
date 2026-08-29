@@ -41,73 +41,12 @@ Key features
   quantities onto the original slope geometry.
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
    :caption: Getting started
 
+   examples
    installation
-   cli
-
-API Reference
-=============
-
-Core package
-------------
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Core modules
-
-   _model
-   _geometry
-   _geometry3d
-   _pointcloud
-   _mesh
-   _material
-   _vegetation
-   _rock
-   _slope
-   _seeder
-   _trajectories
-   _analysis
-   _functionalities
-   _filesystem
-   _utils
-
-Statistics subpackage
-----------------------
-
-.. toctree::
-   :maxdepth: 1
-   :caption: pyrockfall.stats
-
-   stats/_distribution
-   stats/_vector
-   stats/_affine
-   stats/_truncate
-   stats/_deterministic
-   stats/_normal
-   stats/_uniform
-   stats/_triangular
-   stats/_beta
-   stats/_exponential
-   stats/_lognormal
-   stats/_gamma
-   stats/_func
-   stats/_func_vec
-   stats/_utils
-
-Scripts subpackage
--------------------
-
-.. toctree::
-   :maxdepth: 1
-   :caption: pyrockfall.scripts
-
-   scripts/create
-   scripts/extract
-   scripts/section
-   scripts/_data
-   scripts/_style
+   manual
 
 Indices and tables
 ==================

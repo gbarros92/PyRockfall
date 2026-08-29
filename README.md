@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/gbarros92/PyRockfall/main/docs/source/_static/logo.png" alt="PyRockfall logo" width="200">
+</p>
+
 # PyRockfall
 
 [![Tests](https://github.com/gbarros92/PyRockfall/actions/workflows/tests.yml/badge.svg)](https://github.com/gbarros92/PyRockfall/actions/workflows/tests.yml)
@@ -41,3 +45,8 @@ Install PyRockfall from PyPI:
 
 ```bash
 pip install pyrockfall
+```
+
+See the [documentation](https://gbarros92.github.io/PyRockfall/) for full
+installation instructions, worked [examples](https://gbarros92.github.io/PyRockfall/examples.html),
+and the [manual](https://gbarros92.github.io/PyRockfall/manual.html).
