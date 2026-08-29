@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyrockfall"
-version = "0.1.1"
+version = "0.1.2"
 description = "Open-source vectorised framework for stochastic rockfall simulation"
 readme = "README.md"
 requires-python = ">=3.10"
