@@ -744,7 +744,7 @@ class Analysis:
                 samples=pro,
                 tol=self.tolerance,
             )
-            good_elm = np.isfinite(dt_elm)
+            good_elm = np.isfinite(dt_elm) & (np.abs(dt_elm) > 0.0)
 
             if self.hasVegetation:
                 seg2, dt_seg = self.vegetation.intersectParabola(
@@ -755,7 +755,7 @@ class Analysis:
                     samples=can,
                     tol=self.tolerance,
                 )
-                good_seg = np.isfinite(dt_seg)
+                good_seg = np.isfinite(dt_seg) & (np.abs(dt_seg) > 0.0)
 
                 hit_elm = good_elm & (~good_seg | (dt_elm <= dt_seg))
                 hit_seg = good_seg & (~good_elm | (dt_seg < dt_elm))
@@ -769,7 +769,7 @@ class Analysis:
                 seg_out = seg.copy()
                 seg_out[hit_seg] = seg2[hit_seg]
             else:
-                good = np.isfinite(dt_elm)
+                good = np.isfinite(dt_elm) & (np.abs(dt_elm) > 0.0)
                 hit_elm = good_elm
                 dt = dt_elm
                 seg_out = seg
@@ -783,7 +783,7 @@ class Analysis:
                     pos[:, no_hit], vel[:, no_hit], acc[:, no_hit],
                     self.slope.floor, t_min=0.0, tol=self.tolerance,
                 )
-                floor_hit = np.isfinite(dt_floor)
+                floor_hit = np.isfinite(dt_floor) & (np.abs(dt_floor) > 0.0)
                 if np.any(floor_hit):
                     idx_floor = np.flatnonzero(no_hit)[floor_hit]
                     dt[idx_floor] = dt_floor[floor_hit]
@@ -834,8 +834,8 @@ class Analysis:
                 tol=self.tolerance,
                 t_min=self.tolerance
             )
-            good_elm = np.isfinite(dt_elm)
-            good_seg = np.isfinite(dt_seg)
+            good_elm = np.isfinite(dt_elm) & (np.abs(dt_elm) > 0.0)
+            good_seg = np.isfinite(dt_seg) & (np.abs(dt_seg) > 0.0)
 
             hit_elm = good_elm & (~good_seg | (dt_elm <= dt_seg))
             hit_seg = good_seg & (~good_elm | (dt_seg < dt_elm))
@@ -964,11 +964,11 @@ class Analysis:
                 normal_on_el = self._addRoughness(normal_on_el, id_on_el, roughness_samples, cum_impacts)
                 vn_on_el, vt_on_el = decompose(vel_on_el, normal_on_el)
                 an_on_el, at_on_el = decompose(acc_on_el, normal_on_el)
-                vn_on_el[np.abs(vn_on_el) < self.stoppedVelocity] = 0.0  # force parallel when vn is nearly zero
+                is_low = np.abs(vn_on_el) < self.normalVelocityThreshold  # check if velocity before impact is less then threshold
+                vn_on_el[is_low] = 0.0  # force parallel when vn is nearly zero
 
                 # check if impacting
                 is_imp = self._isImpacting(vn_on_el)
-                is_low = np.abs(vn_on_el) < self.normalVelocityThreshold  # check if velocity before impact is less then threshold
                 
                 if np.any(is_imp):
                     # get impacting samples
@@ -988,7 +988,7 @@ class Analysis:
                     setSubSamples(is_imp, (vn_post, vt_post, w_post), vn_on_el, vt_on_el, w_on_el)
 
                 # check if sliding
-                is_low |= np.abs(vn_on_el) < self.stoppedVelocity  # check if post impact velocity is mearly zero
+                is_low |= np.abs(vn_on_el) < self.normalVelocityThreshold  # check if post impact velocity is nearly zero
                 is_sliding_on_el = np.full_like(is_low, False, dtype=bool)
                 if np.any(is_low):
                     vt_low, normal_low, phi_low = getSubSamples(is_low, vt_on_el, normal_on_el, mp_on_el[2])
@@ -1042,7 +1042,7 @@ class Analysis:
                     canopy=can_fall,
                     drag_params=drag_fall,
                 )
-                good = np.isfinite(dt)
+                good = np.isfinite(dt) & (np.abs(dt) > 0.0)
                 idx = np.flatnonzero(is_falling)
                 idx_keep = idx[good]
                 idx_drop = idx[~good]
