@@ -25,6 +25,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: "pip"
 
+      - name: Install Open3D runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libgomp1
+
       - name: Install package and dev dependencies
         run: python -m pip install -e ".[dev]"
 
