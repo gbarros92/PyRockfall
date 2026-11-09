@@ -51,6 +51,7 @@ from ._utils import (
     sampleNormals,
     getSubSamples,
     setSubSamples,
+    scatterSubSamples,
 )
 
 class Sampling(Enum):
@@ -987,7 +988,8 @@ class Analysis:
                 
                 if np.any(is_imp):
                     # get impacting samples
-                    vn_imp, vt_imp, w_imp, m_imp, d_imp, rn_imp, rt_imp, normal_imp = getSubSamples(is_imp,
+                    t_imp, pos_imp, id_imp, vn_imp, vt_imp, w_imp, m_imp, d_imp, rn_imp, rt_imp, normal_imp = getSubSamples(is_imp,
+                        t_on_el, pos_on_el, id_on_el,
                         vn_on_el, vt_on_el, w_on_el,
                         rp_on_el[0], rp_on_el[1], mp_on_el[0], mp_on_el[1],
                         normal_on_el
@@ -1000,15 +1002,28 @@ class Analysis:
                         rn_imp, rt_imp,
                         normal_imp
                     )
-                    # record impact event (before writing the post-impact
-                    # values back below, which -- for a single-sample array --
-                    # aliases and would silently overwrite vn_imp/vt_imp/w_imp)
-                    t_imp, pos_imp, id_imp = getSubSamples(is_imp, t_on_el, pos_on_el, id_on_el)
+
+                    # is_imp/vn_imp/etc. are variable-size, order-losing subsets of impacting blocks;
+                    # their count and identities change each iteration. Scatter them onto the full,
+                    # fixed-size block set, filling non-impacting blocks with NaNs.
+                    # This gives Impacts one fixed-shape row per block, like Trajectories,
+                    # while preserving block identity.
+                    (full_is_imp,) = scatterSubSamples(is_on_el, False, is_imp)
+                    t_full, pos_full, normal_full, vn_imp_full, vt_imp_full, w_imp_full, \
+                        vn_post_full, vt_post_full, w_post_full, rn_full, rt_full = scatterSubSamples(
+                            full_is_imp, np.nan,
+                            t_imp, pos_imp, normal_imp,
+                            vn_imp, vt_imp, w_imp,
+                            vn_post, vt_post, w_post,
+                            rn_imp, rt_imp,
+                        )
+                    (id_full,) = scatterSubSamples(full_is_imp, -1, id_imp)
+
                     self.impacts.addData(
-                        t_imp, pos_imp, normal_imp, id_imp,
-                        vn_imp, vt_imp, w_imp,
-                        vn_post, vt_post, w_post,
-                        rn_imp, rt_imp,
+                        t_full, pos_full, normal_full, id_full,
+                        vn_imp_full, vt_imp_full, w_imp_full,
+                        vn_post_full, vt_post_full, w_post_full,
+                        rn_full, rt_full,
                     )
 
                     setSubSamples(is_imp, (vn_post, vt_post, w_post), vn_on_el, vt_on_el, w_on_el)
