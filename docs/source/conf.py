@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath('../../src'))
 project = 'pyrockfall'
 copyright = '2026, Guilherme Barros'
 author = 'Guilherme Barros'
-release = '0.1.3'
+release = '0.1.4'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
