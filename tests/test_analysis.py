@@ -102,6 +102,15 @@ def test_copy_constructor_does_not_carry_trajectories():
     assert copy.trajectories.mass == 0.0
 
 
+def test_copy_constructor_does_not_carry_impacts():
+    original = Analysis()
+    original.impacts.addData(0.0, [1.0], [0.0], 5,
+                              1.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 1.0)
+    copy = Analysis(copy=original)
+    assert copy.impacts is not original.impacts
+    assert len(copy.impacts._time_history) == 0
+
+
 # ---------------------------------------------------------------------------
 # slope / vegetation / maps properties
 # ---------------------------------------------------------------------------
@@ -730,6 +739,53 @@ def test_run_block_slides_down_incline_and_settles_on_frictional_runout():
     assert np.all((final_pos[0] >= 10.0 - 1e-6) & (final_pos[0] <= 30.0))
     np.testing.assert_allclose(final_pos[1], 0.0, atol=1e-6)
     np.testing.assert_allclose(final_vel, 0.0, atol=1e-6)
+
+
+def test_run_vertical_drop_impacts_match_geometric_decay():
+    # A block dropped straight down onto a flat, frictionless floor bounces
+    # on the spot: each bounce's incoming speed is `kn` times the previous
+    # one (same floor level each time, so launch speed == next incoming
+    # speed by symmetry of free fall). The block stops impacting once that
+    # speed drops below `normalVelocityThreshold` -- i.e. after the smallest
+    # N with kn**N * sqrt(2*g*h) < threshold impacts.
+    g = 9.81
+    h = 20.0
+    kn = 0.5
+    threshold = 0.1
+
+    nodes = np.array([[-1.0, 0.0], [1.0, 0.0]])
+    material = pr.Material(name="A", normalRestitution=kn, tangentialRestitution=1.0, frictionAngle=0.0)
+    slope = pr.Slope(pr.Geometry(nodes=nodes), materials=material)
+
+    rock = pr.Rock(name="R", mass=10.0, density=2500.0)
+    seeder = pr.Seeder(points=np.array([0.0, h]), rocks=[rock])
+    seeder.numberOfRocks = 1
+    seeder.translationalVelocity = [0.0, 0.0]
+    seeder.angularVelocity = [0.0]
+
+    a = Analysis()
+    a.seeders = [seeder]
+    a.slope = slope
+    a.samplingMethod = Sampling.MonteCarlo
+    a.useSpecificSeed = True
+    a.specificSeed = 1
+    a.maxIter = 200
+    a.gravity = -g
+    a.normalVelocityThreshold = threshold
+    assert a.scaleByVelocity is False and a.scaleByMass is False  # no scaling, as intended
+
+    a.run()
+
+    v0 = np.sqrt(2 * g * h)
+    N = int(np.floor(np.log(threshold / v0) / np.log(kn))) + 1
+    assert kn ** N * v0 < threshold <= kn ** (N - 1) * v0  # sanity check on N itself
+
+    assert a.impacts.numberOfImpacts == N
+
+    expected_incoming_speed = v0 * kn ** np.arange(N)
+    np.testing.assert_allclose(
+        a.impacts.normalImpactVelocityHistory.flatten(), -expected_incoming_speed, rtol=1e-5
+    )
 
 
 def test_run_raises_when_not_configured():

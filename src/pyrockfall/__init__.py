@@ -19,6 +19,7 @@ from ._rock import Rock
 from ._seeder import SeederRocksThrown, Seeder, LineSeeder, AreaSeeder
 from ._analysis import Analysis, Sampling, AnalysisRocksThrown
 from ._trajectories import Trajectories
+from ._impacts import Impacts
 from ._functionalities import *
 from ._filesystem import (
     readMaterials, writeMaterials,  # Read/write material libraries as csv

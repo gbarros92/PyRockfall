@@ -45,6 +45,7 @@ from ._seeder import Seeder, SeederRocksThrown
 from ._slope import Slope
 from ._vegetation import Vegetation
 from ._trajectories import Trajectories
+from ._impacts import Impacts
 from ._utils import (
     decompose,
     sampleNormals,
@@ -92,6 +93,17 @@ class Analysis:
     """
 
     def __init__(self, copy: Optional["Analysis"] = None):
+        """
+        Args:
+            copy (Analysis, optional): If given, copies this instance's
+                configuration (seeders, slope, vegetation, physics parameters,
+                etc.) into the new instance. This is meant for users who want
+                to take an existing (possibly already-run) Analysis, tweak a
+                setting, and re-run it from scratch -- it copies the setup
+                only, never simulation results: `trajectories` and `impacts`
+                are always created fresh and empty, regardless of whether
+                `copy` already holds a finished simulation.
+        """
         # --- Configuration / fixed attributes only ---
         self.seeders: List[Seeder] = []
         self._slope: Optional[Slope] = None
@@ -132,7 +144,10 @@ class Analysis:
                 }:
                     setattr(self, attr, value)
 
+        # Always fresh, even when copying another Analysis: `copy` carries over
+        # settings for a rerun, not a previous run's results.
         self.trajectories = Trajectories()
+        self.impacts = Impacts()
 
     @property
     def slope(self) -> Slope:
@@ -985,6 +1000,17 @@ class Analysis:
                         rn_imp, rt_imp,
                         normal_imp
                     )
+                    # record impact event (before writing the post-impact
+                    # values back below, which -- for a single-sample array --
+                    # aliases and would silently overwrite vn_imp/vt_imp/w_imp)
+                    t_imp, pos_imp, id_imp = getSubSamples(is_imp, t_on_el, pos_on_el, id_on_el)
+                    self.impacts.addData(
+                        t_imp, pos_imp, normal_imp, id_imp,
+                        vn_imp, vt_imp, w_imp,
+                        vn_post, vt_post, w_post,
+                        rn_imp, rt_imp,
+                    )
+
                     setSubSamples(is_imp, (vn_post, vt_post, w_post), vn_on_el, vt_on_el, w_on_el)
 
                 # check if sliding
@@ -1071,6 +1097,7 @@ class Analysis:
 
     def postprocess(self, rock_params: np.ndarray) -> None:
         self.trajectories.simulationDone()
+        self.impacts.simulationDone()
         mass = rock_params[0, :]
         density = rock_params[1, :]
         r = np.cbrt(3 * mass / (4 * np.pi * density))

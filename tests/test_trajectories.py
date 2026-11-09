@@ -329,18 +329,6 @@ def test_history_properties_have_expected_shapes(ndim):
     assert traj.numberOfBlocks == 2
 
 
-@pytest.mark.parametrize("ndim", DIMS)
-def test_impact_arrays_are_transposed_history(ndim):
-    horiz_vel = np.array([[3.0]]) if ndim == 2 else np.array([[3.0], [1.0]])
-    traj, H, v_horiz, T = make_free_fall_trajectory(ndim, heights=[20.0], horiz_vel=horiz_vel, g=9.81)
-
-    np.testing.assert_allclose(traj.impactPoints, np.transpose(traj.positionHistory, (1, 0, 2)))
-    np.testing.assert_allclose(traj.impactVelocities, np.transpose(traj.velocityHistory, (1, 0, 2)))
-    np.testing.assert_allclose(
-        traj.impactAngularVelocities, np.transpose(traj.angularVelocityHistory, (1, 0, 2))
-    )
-
-
 def test_start_stop_time_and_endpoints():
     traj, H, v_horiz, T = make_free_fall_trajectory(2, heights=[20.0, 5.0], horiz_vel=np.array([[3.0, 1.0]]), g=9.81)
     np.testing.assert_allclose(traj.startTime, [0.0, 0.0])

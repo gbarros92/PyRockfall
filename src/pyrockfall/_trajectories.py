@@ -142,33 +142,6 @@ class Trajectories:
 
 
     @property
-    def impactPoints(self):
-        """
-        Returns:
-            np.ndarray: Position history of all blocks in shape (dim, impact #, blocks).
-        """
-        return np.transpose(np.array(self.positionHistory), (1, 0, 2))
-
-
-    @property
-    def impactVelocities(self):
-        """
-        Returns:
-            np.ndarray: Velocity history of all blocks in shape (dim, impact #, blocks).
-        """
-        return np.transpose(np.array(self.velocityHistory), (1, 0, 2))
-
-
-    @property
-    def impactAngularVelocities(self):
-        """
-        Returns:
-            np.ndarray: Angular velocity history of shape (dim, impact #, blocks).
-        """
-        return np.transpose(np.array(self.angularVelocityHistory), (1, 0, 2))
-
-
-    @property
     def endpoints(self):
         """
         Returns:
