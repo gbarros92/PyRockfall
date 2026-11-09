@@ -1735,6 +1735,19 @@ def setSubSamples(index: np.ndarray, values: Tuple, *arrays: np.ndarray) -> None
             a[...] = v
 
 
+def scatterSubSamples(index: np.ndarray, fill: float, *values: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Inverse of getSubSamples: scatter values selected by `index` (a
+    boolean mask over the last axis) back into full-size arrays of shape
+    value.shape[:-1] + index.shape, filling non-selected entries with `fill`.
+    """
+    out = []
+    for v in values:
+        full = np.full(v.shape[:-1] + index.shape, fill, dtype=v.dtype)
+        full[..., index] = v
+        out.append(full)
+    return tuple(out)
+
+
 def sampleNormals(position: np.ndarray, elementsIDs: np.ndarray, elementNormals: np.ndarray) -> np.ndarray:
     """Sample the normal vectors at the given positions."""
     S = position.shape[1]
