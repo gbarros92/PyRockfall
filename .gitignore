@@ -225,3 +225,11 @@ __marimo__/
 *.png
 *.jpg
 *.jpeg
+
+# Simulation files
+*.fal8
+*.ini
+*.txt
+
+# 3D Models
+*.ply
