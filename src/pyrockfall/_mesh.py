@@ -817,71 +817,90 @@ class Mesh(Model):
         x_max = tri_max[:, 0]          # (E,)
         z_c = tri_centroids[:, 2]          # (E,)
 
-        # Broadcasted slab mask: (S,E)
-        M = (x_min[None, :] <= x_positions[:, None]) & (x_max[None, :] >= x_positions[:, None])
-
-        # Use -inf outside the slab so argmax ignores them
-        Z = np.where(M, z_c[None, :], -np.inf)   # (S,E)
-
-        # Argmax per slice (S,)
-        init_idx = Z.argmax(axis=1)
+        # Start triangle of each slice: the highest one it crosses. Triangles are
+        # sorted by their lower bound once, so each slice only looks at the few
+        # that can reach it (memory stays O(E) instead of a slices x triangles table).
+        by_min = np.argsort(x_min, kind="stable")
+        x_min_sorted = x_min[by_min]
+        finite_ext = (x_max - x_min)[np.isfinite(x_max - x_min)]
+        max_extent = float(finite_ext.max()) if finite_ext.size else 0.0
+        lo = np.searchsorted(x_min_sorted, x_positions - max_extent, side="left")
+        hi = np.searchsorted(x_min_sorted, x_positions, side="right")
+        init_idx = np.full(x_positions.size, -1, dtype=np.int64)
+        for i in range(x_positions.size):
+            cand = by_min[lo[i]:hi[i]]
+            cand = cand[x_max[cand] >= x_positions[i]]
+            if cand.size:
+                init_idx[i] = cand[np.argmax(z_c[cand])]
         nodes = []
-        elements = []        
-        nohit = ~M.any(axis=1)
-        init_idx[nohit] = -1
+        elements = []
         current_idx = np.array(init_idx, copy=True)
 
         def _check_walk(steps: int) -> None:
             # A walk can visit each triangle at most once; more means it is going
-            # round in circles, which happens when a slice passes exactly through
-            # mesh vertices.
+            # round in circles (inconsistent connectivity).
             if steps > E:
                 raise ValueError(
-                    "Slice walk did not terminate: a slice passes exactly through mesh "
-                    "vertices. Change `increment` slightly."
+                    "Slice walk did not terminate; check the mesh connectivity or "
+                    "change `increment` slightly."
                 )
 
-        # LEFT walk
-        steps = 0
-        while np.any(current_idx >= 0):
-            steps += 1
-            _check_walk(steps)
-            good = current_idx >= 0
-            if not np.any(good):
-                break
-            current_tri = T[current_idx[good], :]
-            Y, Zp, Eids = tri_plane_intersections_yz_per_triangle(
-                V[current_tri], x_positions[good], eps=1e-9
-            )
-            y = np.full(len(x_positions), -np.inf, float)
-            z = np.full(len(x_positions), -np.inf, float)
-            y[good] = Y[:, 0]
-            z[good] = Zp[:, 0]
-            nodes = [np.stack((y, z), axis=1)] + nodes
-            elements = [np.array(current_idx, copy=True)] + elements
-            current_idx[good] = neighbours[current_idx[good], Eids[:, 0]]
+        n_slices = x_positions.size
 
-        # RIGHT walk
-        current_idx = np.array(init_idx, copy=True)
-        steps = 0
-        while np.any(current_idx >= 0):
-            steps += 1
-            _check_walk(steps)
-            good = current_idx >= 0
-            if not np.any(good):
-                break
-            current_tri = T[current_idx[good], :]
-            Y, Zp, Eids = tri_plane_intersections_yz_per_triangle(
-                V[current_tri], x_positions[good], eps=1e-9
-            )
-            y = np.full(len(x_positions), np.inf, float)
-            z = np.full(len(x_positions), np.inf, float)
-            y[good] = Y[:, 1]
-            z[good] = Zp[:, 1]
-            current_idx[good] = neighbours[current_idx[good], Eids[:, 1]]
-            nodes += [np.stack((y, z), axis=1)]
-            elements += [np.array(current_idx, copy=True)]
-        
+        def _walk(side: int):
+            """Follow each cut from its start triangle to the edge of the mesh.
+
+            The cut leaves the start triangle through its lower (`side` 0) or
+            higher (`side` 1) intersection in the second coordinate. In every
+            following triangle it leaves through the intersection it did not come
+            in by, so the cut may turn back on itself (rough or overhanging
+            surface). Returns, per step, the exit node of every slice, the
+            triangle it was in and the triangle it moved to.
+            """
+            cur = np.array(init_idx, copy=True)
+            prev = np.full(n_slices, -2, dtype=np.int64)
+            out_nodes, out_cur, out_next = [], [], []
+            steps = 0
+            while np.any(cur >= 0):
+                steps += 1
+                _check_walk(steps)
+                good = np.flatnonzero(cur >= 0)
+                tri_ids = cur[good]
+                Y, Zp, Eids = tri_plane_intersections_yz_per_triangle(
+                    V[T[tri_ids, :]], x_positions[good], eps=1e-9
+                )
+                nb = np.where(Eids >= 0, neighbours[tri_ids[:, None], np.maximum(Eids, 0)], -1)  # (g,2)
+                if steps == 1:
+                    pick = np.full(good.size, side, dtype=np.int64)
+                else:
+                    pick = np.where(nb[:, 0] == prev[good], 1, 0)
+                rows = np.arange(good.size)
+                valid = Eids[rows, pick] >= 0
+                nxt = np.where(valid, nb[rows, pick], -1)
+                nxt[nxt == init_idx[good]] = -1          # a closed cut: stop where it started
+
+                node = np.full((n_slices, 2), np.nan)
+                node[good[valid], 0] = Y[rows, pick][valid]
+                node[good[valid], 1] = Zp[rows, pick][valid]
+                here = np.full(n_slices, -1, dtype=np.int64)
+                here[good[valid]] = tri_ids[valid]
+                there = np.full(n_slices, -1, dtype=np.int64)
+                there[good] = nxt
+                out_nodes.append(node)
+                out_cur.append(here)
+                out_next.append(there)
+
+                prev[good] = tri_ids
+                cur[good] = nxt
+            return out_nodes, out_cur, out_next
+
+        # One way from the start triangle, then the other. The first walk owns the
+        # start triangle; the second contributes the triangles it moves into.
+        left_nodes, left_cur, _ = _walk(0)
+        right_nodes, _, right_next = _walk(1)
+        nodes = left_nodes[::-1] + right_nodes
+        elements = left_cur[::-1] + right_next
+
         nodes = np.stack(nodes, axis=1)
         elements = np.stack(elements, axis=1)
 
