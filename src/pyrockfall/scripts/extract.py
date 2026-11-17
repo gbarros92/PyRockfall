@@ -14,7 +14,7 @@ HELP = "Extract profiles from 3D model."
 
 def add_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("filename", help="Input point cloud file (.ply with material attributes).")
-    ap.add_argument("-L", "--segment-length", type=float, default=10.0, help="Minimum segment length (m).")
+    ap.add_argument("-L", "--segment-length", type=float, default=10.0, help="Segment length along the strike (m).")
     ap.add_argument("-S", "--profile-spacing", type=float, default=1.0, help="Spacing between profiles (m).")
     ap.add_argument("-q", "--profile-resolution", type=float, default=0.15, help="Profile resolution (m).")
     ap.add_argument("-n", "--material-name", default="Material", help="Attribute name for material IDs in point cloud PLY.")
@@ -40,7 +40,7 @@ def add_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--save-segments",
         choices=["yes", "no", "aligned"],
         default="no",
-        help="Save segments: yes, no, or aligned."
+        help="Save segments: yes, no, or aligned (unrolled strike, dip-direction, elevation coordinates)."
     )
 
     return ap
@@ -94,10 +94,7 @@ def main_from_namespace(args: argparse.Namespace) -> int:
 @dataclass
 class ProcessResult:
     min_z: float
-    mdl_dip_dir: float
-    mdl_centre: np.ndarray
-    mdl_clip_dip_dir: float
-    mdl_clip_centre: np.ndarray
+    frame: pr.CurvilinearFrame
 
 
 def process_model(
@@ -106,51 +103,22 @@ def process_model(
         profile_spacing: float,
         remove_ids: List[int] = [],
     ) -> ProcessResult:
-    # Align model with x axis
-    mdl_dip_dir = mdl.dipDirection()
-    print(f'Model dip direction: {mdl_dip_dir}')
-    mdl_centre = mdl.centroid()
-    mdl.alignWithX(sense=-1)
+    # Fit the curvilinear frame: s along the strike, d down-dip, e elevation.
+    # Slicing along s needs no alignment of the model with an axis.
+    frame = mdl.fitFrame()
+    print(f'Wall length: {frame.length:.2f} in {frame.n_segments} polyline segments')
+    info = frame.diagnostics(mdl.points)
+    if info["n_nan"] or info["n_ambiguous"]:
+        print(f'⚠️ {info["n_nan"]} points outside the frame, {info["n_ambiguous"]} ambiguous')
 
-    # Remove selected materials
-    delta_remove = 0.0
-    pmin, pmax = mdl.boundingBox()
-    points = mdl.points.copy()
-    for id in remove_ids:
-        points_to_remove = points[mdl.get_attr(material_name) == id]
-        points = points[mdl.get_attr(material_name) != id]
-        if points_to_remove.size > 0:
-            delta_remove = points_to_remove[:,2].max() - points_to_remove[:,2].min()
+    # Common floor for all profiles: lowest elevation reached by every complete
+    # slice, excluding the specified materials
+    min_z = pr.wallFloorElevation(
+        mdl, profile_spacing, label=material_name, ignore_ids=list(remove_ids), frame=frame
+    )
+    mdl.apply_point_mask_(mdl.points[:, 2] >= min_z)  # Remove points below the common floor
 
-    if len(remove_ids) == 0:
-        delta_remove = profile_spacing
-
-    # Create a common floor for all profiles by finding the minimum z value in the model excluding specified materials
-    max_z_pts = points[:,2].max()
-    min_z_pts = points[:,2].min()
-    min_z = min_z_pts
-    for x in np.arange(pmin[0]+profile_spacing/2, pmax[0], profile_spacing):
-        mask = (points[:,0] >= x-profile_spacing/2) & (points[:,0] < x+profile_spacing/2)
-        points_in_slice = points[mask]
-        if points_in_slice.size == 0:
-            continue
-        max_z_slice = points_in_slice[:,2].max()
-        if max_z_slice < max_z_pts - delta_remove:
-            continue  # Ignore incomplete slices
-        min_z_slice = points_in_slice[:,2].min()
-        if min_z_slice > min_z_pts + delta_remove:
-            continue  # Ignore incomplete slices
-        min_z = max(min_z, min_z_slice)
-    pmin[2] = min_z  # Set minimum z value to the lowest point in
-    mdl.clip(pmin, pmax)  # Clip model to remove points below the minimum z value
-
-    # Re-align model with x axis after clipping
-    mdl_clip_dip_dir = mdl.dipDirection()
-    print(f'Model dip direction after clip: {mdl_clip_dip_dir}')
-    mdl_clip_centre = mdl.centroid()
-    mdl.alignWithX(sense=-1)
-
-    return ProcessResult(min_z, mdl_dip_dir, mdl_centre, mdl_clip_dip_dir, mdl_clip_centre)
+    return ProcessResult(min_z, frame)
 
 
 def extract_profiles(
@@ -168,34 +136,35 @@ def extract_profiles(
     ) -> None:
     # Get segments from model with specified segment length
     coords_list: List[np.ndarray] = []
+    frame = processed.frame
 
-    def Rz(theta):
-        c, s = np.cos(theta), np.sin(theta)
-        return np.array([[c, -s, 0.0],
-                        [s,  c, 0.0],
-                        [0.0, 0.0, 1.0]])
     def save_seg(seg_id, seg):
-        if save_segments:
-            seg.save(save_segments+f'_{seg_id}.ply', attributes=material_name, overwrite=True)
+        if not save_segments:
+            return
+        if do_save_segments_aligned:
+            # Unrolled coordinates (s, d, e) instead of (x, y, z)
+            sde = np.nan_to_num(frame.xyz_to_sde(seg.points))
+            n = seg.points.shape[0]
+            attrs = {k: v for k, v in seg.attrs.items() if v.shape[0] == n}
+            if isinstance(seg, pr.Mesh):
+                seg = pr.Mesh(points=sde, triangles=seg.triangles, attrs=attrs)
+            else:
+                seg = pr.PointCloud(points=sde, attrs=attrs)
+        seg.save(save_segments+f'_{seg_id}.ply', attributes=material_name, overwrite=True)
 
     profile_id = -1
     for seg_id, seg in enumerate(mdl.segment(segment_length)):
-        # Align segment with x axis
-        seg_dip_dir = seg.dipDirection()
-        print(f'Segment {seg_id} dip direction: {seg_dip_dir}')
-        seg_centre = seg.centroid()
-        if not do_save_segments_aligned: save_seg(seg_id, seg)
-        seg.alignWithX(sense=-1)
-        if do_save_segments_aligned: save_seg(seg_id, seg)
+        save_seg(seg_id, seg)
 
-        # Extract profiles from segment
+        # Extract profiles from segment: slices of constant s, nodes in (d, e)
         slices, positions = seg.slice(
-            direction=np.array([1.0, 0.0, 0.0]),
+            None,
             increment=profile_spacing,
             slice_height_increment=profile_resolution,
             label=material_name,
+            frame=frame,
         )
-        for profile, x in zip(slices[::-1], positions[::-1]):
+        for profile, s_k in zip(slices, positions):
             # Find beginning of the floor
             profile.nodes[-1][1] = processed.min_z  # Ensure profile ends at the floor
 
@@ -248,15 +217,10 @@ def extract_profiles(
                 new_elements = old_to_new[new_elements]
                 profile = pr.Geometry(new_nodes, new_nodes_std, new_elements, new_attributes)
             
-            if save_coords:        
-                yz = np.transpose(profile.nodes)
-                coords = np.vstack((np.full_like(yz[0], x), yz))
-                for cen, ang in zip(
-                    (seg_centre, processed.mdl_clip_centre, processed.mdl_centre),
-                    (seg_dip_dir, processed.mdl_clip_dip_dir, processed.mdl_dip_dir)):
-                    coords -= cen[:, None]
-                    coords = Rz(-np.radians(ang)) @ coords
-                    coords += cen[:, None]
+            if save_coords:
+                # Back to world coordinates through the frame
+                sde = np.column_stack((np.full(len(profile.nodes), s_k), profile.nodes))
+                coords = frame.sde_to_xyz(sde).T
                 mat_list = profile.attributes
                 if mat_list is None:
                     mat_list = np.full_like(profile.elements, -1)

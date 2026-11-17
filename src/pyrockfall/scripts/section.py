@@ -18,11 +18,11 @@ def add_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "-r", "--transverse-radius",
         type=float,
         default=None,
-        help="Half-width of the strip used to assign points to each section (m). Defaults to half the point cloud's vertical extent."
+        help="Half-width, along the dip direction, of the strip of points used for each section (m). Defaults to all points of the slab."
     )
 
     ap.add_argument("--min-points", type=int, default=20, help="Minimum number of points required for a section to be valid.")
-    ap.add_argument("--max-turn-angle", type=float, default=45.0, help="Maximum change in marching direction between consecutive nodes (degrees).")
+    ap.add_argument("--max-turn-angle", type=float, default=45.0, help="Ignored; kept for backward compatibility.")
 
     ap.add_argument(
         "--save-profiles",
