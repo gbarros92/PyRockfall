@@ -7,6 +7,7 @@ Core interface for the pyrockfall rockfall simulation engine.
 Exposes main simulation classes (Slope, Material, Seeder, Analysis, Trajectories)
 and data import utilities at the package level for user convenience.
 """
+from ._frame import CurvilinearFrame, fit_polyline
 from ._model import Model
 from ._pointcloud import PointCloud
 from ._mesh import Mesh
