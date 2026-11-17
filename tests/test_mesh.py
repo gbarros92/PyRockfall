@@ -435,3 +435,193 @@ def test_clip_not_implemented_for_mesh():
     m = pr.Mesh(points=pts, triangles=tris)
     with pytest.raises(NotImplementedError):
         m.clip(np.zeros(3), np.ones(3))
+
+
+# ---------------------------------------------------------------------------
+# Curvilinear frame: strike-based slicing, attributes in sub-meshes, point masks
+# ---------------------------------------------------------------------------
+
+def wall_mesh(nx=41, nz=13, length=40.0, height=12.0, dip_deg=60.0, bend=False):
+    """Regular triangulated wall dipping `dip_deg`. With `bend`, the wall turns 90
+    degrees half-way along its length."""
+    s = np.linspace(0.0, length, nx)
+    e = np.linspace(0.0, height, nz)
+    S, E = np.meshgrid(s, e, indexing="ij")
+    D = -(E - 0.5 * height) / np.tan(np.radians(dip_deg))
+    line = [[0.0, 0.0], [0.5 * length, 0.0], [0.5 * length, 0.5 * length]] if bend else [[0.0, 0.0], [length, 0.0]]
+    pts = pr.CurvilinearFrame(line).sde_to_xyz(np.column_stack([S.ravel(), D.ravel(), E.ravel()]))
+    tris = []
+    for i in range(nx - 1):
+        for j in range(nz - 1):
+            a, b, c, d = i * nz + j, (i + 1) * nz + j, i * nz + j + 1, (i + 1) * nz + j + 1
+            tris += [[a, b, d], [a, d, c]]
+    return pts, np.array(tris), E.ravel()
+
+
+def test_slice_along_strike_matches_a_fixed_direction_on_a_straight_wall():
+    pts, tris, e = wall_mesh()
+    m = pr.Mesh(points=pts, triangles=tris)
+    m.set_attr("mat", (e > 6.0).astype(int))
+    # 4.5 keeps the slices off the mesh vertices (which are 1 apart)
+    fixed, xs = m.slice(np.array([1.0, 0.0, 0.0]), increment=4.5, label="mat")
+    strike, ss = m.slice(increment=4.5, label="mat")
+    assert len(strike) == len(fixed) == 9
+    np.testing.assert_allclose(np.diff(ss), 4.5, atol=1e-9)
+    for a, b in zip(fixed, strike):
+        # same profile shape; d is measured from the wall line instead of from y = 0,
+        # and may run in the opposite sense
+        np.testing.assert_allclose(np.sort(b.nodes[:, 1]), np.sort(a.nodes[:, 1]), atol=1e-6)
+        assert np.ptp(b.nodes[:, 0]) == pytest.approx(np.ptp(a.nodes[:, 0]), abs=1e-6)
+        assert sorted(b.attributes.tolist()) == sorted(a.attributes.tolist())
+        # d increases down-dip
+        assert np.corrcoef(b.nodes[:, 0], b.nodes[:, 1])[0, 1] < -0.99
+
+
+def test_slice_along_strike_goes_around_a_corner():
+    pts, tris, e = wall_mesh(nx=81, bend=True)
+    m = pr.Mesh(points=pts, triangles=tris)
+    m.set_attr("mat", (e > 6.0).astype(int))
+    # use the known wall line, so this checks the slicing rather than the polyline fit
+    m.frame = pr.CurvilinearFrame([[0.0, 0.0], [20.0, 0.0], [20.0, 20.0]]).refine_corners(5.0)
+    profiles, ss = m.slice(increment=2.3, label="mat")       # keeps slices off the vertices
+    assert len(profiles) == 17                               # 40 m of wall every 2.3 m
+    for prof in profiles:
+        assert np.ptp(prof.nodes[:, 1]) == pytest.approx(12.0, abs=1e-6)
+        assert np.ptp(prof.nodes[:, 0]) == pytest.approx(12.0 / np.tan(np.radians(60.0)), abs=0.05)
+        assert set(np.unique(prof.attributes)) == {0, 1}
+
+
+def test_segment_keeps_attributes_and_overlap():
+    pts, tris, e = wall_mesh()
+    m = pr.Mesh(points=pts, triangles=tris)
+    m.set_attr("mat", (e > 6.0).astype(int))                 # per point
+    m.set_attr("tri_id", np.arange(tris.shape[0]))           # per triangle
+    segments = m.segment(dx=10.0)
+    assert len(segments) == 4
+    assert sum(seg.triangles.shape[0] for seg in segments) == tris.shape[0]
+    ids = np.concatenate([seg.get_attr("tri_id") for seg in segments])
+    np.testing.assert_array_equal(np.sort(ids), np.arange(tris.shape[0]))
+    for seg in segments:
+        assert seg.get_attr("mat").shape[0] == seg.points.shape[0]
+        np.testing.assert_array_equal(seg.get_attr("mat"), (seg.points[:, 2] > 6.0).astype(int))
+    overlapped = m.segment(dx=10.0, du=5.0)
+    assert sum(seg.triangles.shape[0] for seg in overlapped) > tris.shape[0]
+    with pytest.raises(ValueError, match="du must satisfy"):
+        m.segment(dx=10.0, du=10.0)
+
+
+def test_split_at_the_corner():
+    pts, tris, e = wall_mesh(nx=81, bend=True)
+    m = pr.Mesh(points=pts, triangles=tris)
+    first, second = m.split()
+    assert first.triangles.shape[0] + second.triangles.shape[0] == tris.shape[0]
+    assert first.triangles.shape[0] == pytest.approx(second.triangles.shape[0], rel=0.15)
+    # one part per leg of the wall
+    assert np.ptp(first.points[:, 0]) > 3 * np.ptp(first.points[:, 1])
+    assert np.ptp(second.points[:, 1]) > 3 * np.ptp(second.points[:, 0])
+
+
+def test_point_mask_drops_triangles_and_reindexes():
+    pts, tris = strip_mesh()
+    m = pr.Mesh(points=pts, triangles=tris)
+    m.set_attr("pid", np.arange(6))
+    m.set_attr("tid", np.array([10, 11, 12, 13]))
+    m.apply_point_mask_(np.array([True, True, False, True, True, True]))   # drop point 2
+    assert m.points.shape[0] == 5
+    np.testing.assert_array_equal(m.get_attr("pid"), [0, 1, 3, 4, 5])
+    np.testing.assert_array_equal(m.get_attr("tid"), [10, 11, 13])        # [1, 2, 5] is gone
+    np.testing.assert_array_equal(m.triangles, [[0, 1, 3], [0, 3, 2], [1, 4, 3]])
+    with pytest.raises(ValueError, match="Mask must be boolean"):
+        m.apply_point_mask_(np.ones(3, dtype=bool))
+
+
+def test_remove_points_on_mesh_and_fill_holes_not_available():
+    pts, tris, e = wall_mesh()
+    m = pr.Mesh(points=pts, triangles=tris)
+    m.set_attr("mat", (e > 6.0).astype(int))
+    n = m.removePoints("mat", 1)
+    assert n == np.count_nonzero(e > 6.0)
+    assert m.points[:, 2].max() <= 6.0
+    assert m.triangles.max() < m.points.shape[0]
+    assert m._removed.shape == (n, 3)
+    with pytest.raises(NotImplementedError, match="mesh2PointCloud"):
+        m.fillHoles()
+
+
+def test_slice_through_mesh_vertices_fails_cleanly():
+    # Slices at x = 2, 6, ... pass exactly through the vertices of this regular mesh
+    pts, tris, e = wall_mesh()
+    m = pr.Mesh(points=pts, triangles=tris)
+    m.set_attr("mat", (e > 6.0).astype(int))
+    with pytest.raises(ValueError, match="mesh vertices"):
+        m.slice(np.array([1.0, 0.0, 0.0]), increment=4.0, label="mat")
+
+
+# ---------------------------------------------------------------------------
+# section(): strike-based profiles and their points in world coordinates
+# ---------------------------------------------------------------------------
+
+def test_section_on_a_straight_wall_mesh():
+    pts, tris, e = wall_mesh()
+    m = pr.Mesh(points=pts, triangles=tris)
+    m.set_attr("mat", (e > 6.0).astype(int))
+    m.frame = pr.CurvilinearFrame([[0.0, 0.0], [40.0, 0.0]])
+    before = pts.copy()
+
+    profiles, sections_pc = m.section(increment=4.5, label="mat")
+    assert len(profiles) == 9
+    assert isinstance(sections_pc, pr.PointCloud)
+    np.testing.assert_array_equal(m.points, before)                 # the mesh is not moved
+    ids = sections_pc.get_attr("Profile")
+    np.testing.assert_array_equal(np.unique(ids), np.arange(9))
+
+    width = 12.0 / np.tan(np.radians(60.0))
+    for k, prof in enumerate(profiles):
+        # relative to the crest node and to the base, crest first
+        np.testing.assert_allclose(prof.nodes[0], [0.0, 12.0], atol=1e-9)
+        np.testing.assert_allclose(prof.nodes[-1], [width, 0.0], atol=1e-9)
+        assert np.all(np.diff(prof.nodes[:, 1]) <= 1e-9)
+        assert len(prof.attributes) == prof.nodes.shape[0] - 1
+        # upper half is material 1, lower half material 0
+        mid = 0.5 * (prof.nodes[:-1, 1] + prof.nodes[1:, 1])
+        clear = np.abs(mid - 6.0) > 0.6
+        np.testing.assert_array_equal(prof.attributes[clear], (mid[clear] > 6.0).astype(int))
+
+        # world points: on the section plane x = s_k and on the wall surface
+        xyz = sections_pc.points[ids == k]
+        assert xyz.shape[0] == prof.nodes.shape[0]
+        np.testing.assert_allclose(xyz[:, 0], 2.25 + 4.5 * k, atol=1e-9)
+        np.testing.assert_allclose(xyz[:, 1], -(xyz[:, 2] - 6.0) / np.tan(np.radians(60.0)), atol=1e-9)
+        assert sections_pc.get_attr("mat")[ids == k].shape[0] == xyz.shape[0]
+
+
+def test_section_goes_around_a_corner_on_a_mesh():
+    pts, tris, e = wall_mesh(nx=81, bend=True)
+    m = pr.Mesh(points=pts, triangles=tris)
+    m.set_attr("mat", (e > 6.0).astype(int))
+    m.frame = pr.CurvilinearFrame([[0.0, 0.0], [20.0, 0.0], [20.0, 20.0]]).refine_corners(5.0)
+    profiles, sections_pc = m.section(increment=2.3, label="mat")
+    assert len(profiles) == 17
+    # sections on both legs of the wall, each spanning its full height
+    assert sections_pc.points[:, 0].min() < 3.0 and sections_pc.points[:, 1].max() > 17.0
+    for prof in profiles:
+        assert np.ptp(prof.nodes[:, 1]) == pytest.approx(12.0, abs=1e-6)
+        assert prof.nodes[:, 0].max() == pytest.approx(12.0 / np.tan(np.radians(60.0)), abs=0.05)
+    # every world point lies on a triangle of the mesh: close to its vertices
+    d = np.min(np.linalg.norm(pts[None, :, :] - sections_pc.points[::5, None, :], axis=-1), axis=1)
+    assert d.max() < 1.0
+
+
+def test_section_with_per_triangle_labels_and_no_sections():
+    pts, tris, e = wall_mesh()
+    m = pr.Mesh(points=pts, triangles=tris)
+    tri_mat = (e[tris].mean(axis=1) > 6.0).astype(int)
+    m.set_attr("mat", tri_mat)                                       # per triangle
+    m.frame = pr.CurvilinearFrame([[0.0, 0.0], [40.0, 0.0]])
+    profiles, sections_pc = m.section(increment=4.5, label="mat")
+    assert len(profiles) == 9
+    assert set(np.unique(sections_pc.get_attr("mat"))) == {0, 1}
+    with pytest.raises(ValueError, match="not found"):
+        m.section(increment=4.5, label="missing")
+    with pytest.raises(ValueError, match="needs >=3 points"):      # an empty mesh has no frame
+        pr.Mesh().section(increment=1.0, label="mat")

@@ -179,8 +179,7 @@ def test_from_indices_preserves_selected_points_and_attrs():
 
 
 # ---------------------------------------------------------------------------
-# segment(): requires a genuinely cone-shaped point cloud for coneApproximation
-# to converge to a finite, nonzero radius.
+# segment(): windows along the strike (s coordinate of the curvilinear frame)
 # ---------------------------------------------------------------------------
 
 def cone_wall_points(seed=0, n_theta=60, n_rho=30):
@@ -208,16 +207,37 @@ def test_segment_partitions_a_cone_shaped_wall():
         assert seg.points.shape[0] > 0
 
 
-def test_segment_zero_radius_raises():
-    # A flat, non-conical point cloud: z has no linear relationship with
-    # radial distance from any (x0,y0), so the cone fit's slope stays ~0
-    # and radius blows up/degenerates -- exercised here as a documented
-    # failure mode, not asserted to be "correct" behaviour.
-    xs, ys = np.meshgrid(np.linspace(0, 10, 20), np.linspace(0, 10, 20))
-    pts = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(400)])
+def test_segment_flat_cloud_is_partitioned_exactly():
+    # A flat point cloud has no cone-like shape; windows along the strike
+    # still partition it without losing or duplicating points.
+    xs, ys = np.meshgrid(np.linspace(0, 10, 20), np.linspace(0, 4, 8))
+    pts = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(160)])
     pc = pr.PointCloud(points=pts)
-    with pytest.raises((ValueError, ZeroDivisionError)):
-        pc.segment(ds=1.0)
+    pc.set_attr("id", np.arange(160))
+    segments = pc.segment(ds=2.5)
+    assert len(segments) == 4
+    ids = np.concatenate([seg.get_attr("id") for seg in segments])
+    np.testing.assert_array_equal(np.sort(ids), np.arange(160))
+    for a, b in zip(segments[:-1], segments[1:]):
+        assert a.points[:, 0].max() <= b.points[:, 0].min() + 1e-9
+
+
+def test_segment_overlap_duplicates_points_between_windows():
+    xs, ys = np.meshgrid(np.linspace(0, 10, 41), np.linspace(0, 4, 8))
+    pts = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)])
+    pc = pr.PointCloud(points=pts)
+    plain = sum(seg.points.shape[0] for seg in pc.segment(ds=2.5))
+    overlapped = sum(seg.points.shape[0] for seg in pc.segment(ds=2.5, du=1.0))
+    assert plain == pts.shape[0]
+    assert overlapped > plain
+
+
+def test_segment_rejects_invalid_window():
+    pc = pr.PointCloud(points=np.random.default_rng(0).uniform(size=(50, 3)))
+    with pytest.raises(ValueError, match="ds must be > 0"):
+        pc.segment(ds=0.0)
+    with pytest.raises(ValueError, match="du must satisfy"):
+        pc.segment(ds=1.0, du=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -340,3 +360,287 @@ def test_section_degenerate_input_fails_cleanly():
     pc.set_attr("mat", np.zeros(50, dtype=int))
     with pytest.raises((ValueError, RuntimeError)):
         pc.section(increment=1.0, label="mat", transverse_radius=0.01, min_points=1000)
+
+
+# ---------------------------------------------------------------------------
+# Strike-based slicing (curvilinear frame): a wall with a 90 degree corner
+# ---------------------------------------------------------------------------
+
+def corner_wall(n=12000, seed=0, leg=30.0, height=12.0, dip_deg=60.0):
+    """Wall dipping `dip_deg` that turns 90 degrees half-way, with two layers."""
+    rng = np.random.default_rng(seed)
+    truth = pr.CurvilinearFrame([[0.0, 0.0], [leg, 0.0], [leg, leg]])
+    s = rng.uniform(0.0, 2 * leg, n)
+    e = rng.uniform(0.0, height, n)
+    d = -(e - 0.5 * height) / np.tan(np.radians(dip_deg)) + 0.02 * rng.standard_normal(n)
+    pts = truth.sde_to_xyz(np.column_stack([s, d, e]))
+    mat = (e > 0.5 * height).astype(int)
+    return pts, mat
+
+
+def test_slice_along_strike_follows_the_wall_around_the_corner():
+    pts, mat = corner_wall()
+    pc = pr.PointCloud(points=pts)
+    pc.set_attr("mat", mat)
+    original = pts.copy()
+
+    profiles, s_pos = pc.slice(increment=2.0, label="mat", slice_height_increment=0.5)
+    assert len(profiles) == pytest.approx(30, abs=2)        # 60 m of wall every 2 m
+    np.testing.assert_allclose(np.diff(s_pos), 2.0, atol=1e-9)
+    np.testing.assert_array_equal(pc.points, original)      # the model is not moved
+
+    frame = pc.frame
+    widths = []
+    for prof, s_k in zip(profiles, s_pos):
+        d, e = prof.nodes[:, 0], prof.nodes[:, 1]
+        assert e[0] > e[-1]                                  # crest to toe
+        assert d[-1] > d[0]                                  # d grows down-dip
+        assert e.max() > 11.0 and e.min() < 1.0
+        widths.append(np.ptp(d))
+        mid = 0.5 * (e[:-1] + e[1:])
+        clear = np.abs(mid - 6.0) > 1.0                      # away from the layer boundary
+        np.testing.assert_array_equal(prof.attributes[clear], (mid[clear] > 6.0).astype(int))
+        # back in world coordinates the nodes lie on the wall
+        xyz = frame.sde_to_xyz(np.column_stack([np.full(d.shape, s_k), d, e]))
+        dist = np.min(np.linalg.norm(pts[None, ::7, :] - xyz[:, None, :], axis=-1), axis=1)
+        assert np.median(dist) < 0.6
+    # the same profile everywhere, including through the corner
+    np.testing.assert_allclose(widths, 12.0 / np.tan(np.radians(60.0)), atol=0.6)
+
+
+def test_slice_with_an_explicit_frame_matches_a_fixed_direction():
+    pts, mat = two_material_wall()
+    pc = pr.PointCloud(points=pts)
+    pc.set_attr("mat", mat)
+    fixed, xs = pc.slice(np.array([1.0, 0.0, 0.0]), increment=1.0, label="mat", slice_height_increment=0.3)
+    frame = pr.CurvilinearFrame.straight((0.0, 0.0), (1.0, 0.0))
+    framed, ss = pc.slice(None, increment=1.0, label="mat", slice_height_increment=0.3, frame=frame)
+    np.testing.assert_allclose(ss, xs, atol=1e-9)
+    assert len(fixed) == len(framed)
+    for a, b in zip(fixed, framed):
+        np.testing.assert_allclose(a.nodes, b.nodes, atol=1e-9)
+        np.testing.assert_array_equal(a.attributes, b.attributes)
+
+
+def test_slice_min_points_and_transverse_radius():
+    pts, mat = two_material_wall()
+    pc = pr.PointCloud(points=pts)
+    pc.set_attr("mat", mat)
+    assert pc.slice(increment=1.0, label="mat", slice_height_increment=0.3, min_points=10**6)[0] == []
+    stray = np.array([[5.0, 3.0, 2.5]] * 3)                  # off the wall, in one slab
+    pc2 = pr.PointCloud(points=np.vstack([pts, stray]))
+    pc2.set_attr("mat", np.r_[mat, [0, 0, 0]])
+    profiles, _ = pc2.slice(np.array([1.0, 0.0, 0.0]), increment=1.0, label="mat",
+                            slice_height_increment=0.3, transverse_radius=0.5)
+    assert max(np.abs(p.nodes[:, 0]).max() for p in profiles) < 0.5
+
+
+def test_section_follows_the_corner_and_returns_world_points():
+    pts, mat = corner_wall()
+    pc = pr.PointCloud(points=pts)
+    pc.set_attr("mat", mat)
+    profiles, sections_pc = pc.section(increment=3.0, label="mat")
+    assert len(profiles) == pytest.approx(20, abs=2)
+    ids = sections_pc.get_attr("Profile")
+    assert len(np.unique(ids)) == len(profiles)
+    # sections on both legs of the wall
+    assert sections_pc.points[:, 1].max() > 20.0 and sections_pc.points[:, 0].min() < 5.0
+    for prof in profiles:
+        assert prof.nodes[:, 0].min() == pytest.approx(0.0)  # distance from the crest node
+        assert prof.nodes[:, 1].min() == pytest.approx(0.0)  # height above the base
+
+
+def test_segment_and_split_follow_the_corner():
+    pts, mat = corner_wall()
+    pc = pr.PointCloud(points=pts)
+    pc.set_attr("mat", mat)
+    segments = pc.segment(ds=10.0)
+    assert len(segments) in (6, 7)                           # 60 m of wall; the tail may spill over
+    assert sum(seg.points.shape[0] for seg in segments) == pts.shape[0]
+    assert all(seg.has_attr("mat") and seg._frame is pc._frame for seg in segments)
+
+    first, second = pc.split()
+    assert first.points.shape[0] + second.points.shape[0] == pts.shape[0]
+    # one part per leg: their dip directions differ by about 90 degrees
+    diff = abs(first.dipDirection() - second.dipDirection()) % 360
+    assert min(diff, 360 - diff) == pytest.approx(90.0, abs=10.0)
+
+
+# ---------------------------------------------------------------------------
+# removePoints() / fillHoles()
+# ---------------------------------------------------------------------------
+
+def test_remove_points_by_attribute_value_list_and_mask():
+    pts, mat = corner_wall(n=3000)
+    labels = np.where(pts[:, 2] > 9.0, 5, mat).astype(float)
+    pc = pr.PointCloud(points=pts.copy())
+    pc.set_attr("mat", labels)
+    pc.set_attr("id", np.arange(3000))
+
+    n = pc.removePoints("mat", 5)
+    assert n == np.count_nonzero(labels == 5) > 0
+    assert pc.points.shape[0] == 3000 - n
+    np.testing.assert_array_equal(pc.get_attr("id"), np.flatnonzero(labels != 5))
+    np.testing.assert_allclose(pc._removed, pts[labels == 5])
+
+    n2 = pc.removePoints("mat", [0, 7])                      # 7 does not occur
+    assert n2 == np.count_nonzero(labels == 0)
+    assert set(np.unique(pc.get_attr("mat"))) == {1.0}
+    assert pc._removed.shape[0] == n + n2                    # remembered across calls
+
+    n3 = pc.removePoints(pc.points[:, 2] > 8.0)
+    assert n3 > 0 and pc.points[:, 2].max() <= 8.0
+    assert pc.removePoints("mat", 99) == 0
+
+
+def test_remove_points_rejects_bad_input():
+    pts, mat = corner_wall(n=500)
+    pc = pr.PointCloud(points=pts)
+    pc.set_attr("mat", mat)
+    with pytest.raises(ValueError, match="not found"):
+        pc.removePoints("missing", 0)
+    with pytest.raises(ValueError, match="value"):
+        pc.removePoints("mat")
+    with pytest.raises(ValueError, match="Mask must be boolean"):
+        pc.removePoints(np.zeros(10, dtype=bool))
+    with pytest.raises(ValueError, match="Mask must be boolean"):
+        pc.removePoints(np.zeros(500, dtype=int))
+
+
+def holed_wall(seed=0):
+    """Corner wall with a painted patch (label 9) on the first leg and one on the
+    corner; returns the cloud, the true labels and the patch mask."""
+    pts, mat = corner_wall(n=30000, seed=seed)
+    truth = pr.CurvilinearFrame([[0.0, 0.0], [30.0, 0.0], [30.0, 30.0]])
+    sde = truth.xyz_to_sde(pts)
+    patch = (np.hypot(sde[:, 0] - 12.0, sde[:, 2] - 6.0) < 2.5) | (np.hypot(sde[:, 0] - 30.0, sde[:, 2] - 6.0) < 2.5)
+    labels = np.where(patch, 9, mat)
+    pc = pr.PointCloud(points=pts.copy())
+    pc.set_attr("mat", labels.astype(float))
+    pc.set_attr("colors", np.tile([0.2, 0.4, 0.6], (len(pts), 1)))
+    return pc, pts, mat, patch
+
+
+def test_fill_holes_after_removing_a_class():
+    pc, pts, mat, patch = holed_wall()
+    n_removed = pc.removePoints("mat", 9)
+    assert n_removed == np.count_nonzero(patch)
+    kept = pc.points.copy()
+
+    filled, info = pc.fillHoles(attributes=["mat"], return_info=True)
+    np.testing.assert_array_equal(pc.points, kept)                    # the source is untouched
+    assert len(info["holes"]) == 2
+    new = filled.get_attr("filled") == 1
+    assert new.sum() == info["n_new"] == pytest.approx(n_removed, rel=0.4)
+    np.testing.assert_array_equal(filled.points[~new], kept)
+    assert set(np.unique(filled.get_attr("hole_id")[new])) == {1, 2}
+    assert np.all(filled.get_attr("kriging_std")[~new] == 0)
+
+    # the new points lie on the wall: near the removed ones, and on the same plane
+    removed = pts[patch]
+    d = np.min(np.linalg.norm(removed[None, ::3, :] - filled.points[new][:, None, :], axis=-1), axis=1)
+    assert np.percentile(d, 95) < 0.5
+    truth = pr.CurvilinearFrame([[0.0, 0.0], [30.0, 0.0], [30.0, 30.0]])
+    sde = truth.xyz_to_sde(filled.points[new])
+    on_plane = sde[:, 1] + (sde[:, 2] - 6.0) / np.tan(np.radians(60.0))
+    assert np.sqrt(np.mean(on_plane ** 2)) < 0.1
+
+    # labels: the two layers are recovered, the removed class is gone
+    lab = filled.get_attr("mat")[new]
+    assert set(np.unique(lab)) <= {0.0, 1.0}
+    clear = np.abs(sde[:, 2] - 6.0) > 0.5
+    assert np.mean(lab[clear] == (sde[clear, 2] > 6.0)) > 0.97
+    P = np.column_stack([filled.get_attr("mat_P0"), filled.get_attr("mat_P1")])
+    np.testing.assert_allclose(P.sum(axis=1), 1.0, atol=1e-6)
+    assert np.all(filled.get_attr("mat_Pmax")[~new] == 1.0)           # one-hot for existing points
+    # attributes that are not kriged follow the nearest existing point
+    np.testing.assert_allclose(filled.get_attr("colors")[new], np.tile([0.2, 0.4, 0.6], (new.sum(), 1)))
+
+
+def test_fill_holes_at_the_edge_uses_the_removed_positions():
+    pts, mat = corner_wall(n=20000)
+    crest_bite = (np.abs(pts[:, 0] - 12.0) < 2.5) & (pts[:, 2] > 8.0) & (pts[:, 1] < 10.0)   # open at the crest
+    pc = pr.PointCloud(points=pts.copy())
+    pc.set_attr("mat", mat)
+    pc.removePoints(crest_bite)
+    assert pc.fillHoles(use_removed=False).get_attr("filled").sum() == 0
+    filled = pc.fillHoles()
+    new = filled.get_attr("filled") == 1
+    assert new.sum() == pytest.approx(crest_bite.sum(), rel=0.5)
+    assert filled.points[new][:, 2].min() > 7.0
+
+
+def test_fill_holes_without_holes_returns_a_copy_and_validates_input():
+    pts, mat = corner_wall(n=8000)
+    pc = pr.PointCloud(points=pts)
+    pc.set_attr("mat", mat)
+    out, info = pc.fillHoles(attributes="mat", return_info=True)
+    assert info["n_new"] == 0 and out is not pc
+    np.testing.assert_array_equal(out.points, pts)
+    assert out.get_attr("filled").sum() == 0
+    with pytest.raises(ValueError, match="not found"):
+        pc.fillHoles(attributes=["missing"])
+    with pytest.raises(ValueError, match="others must be"):
+        pc.fillHoles(others="zero")
+
+
+def test_fill_holes_kinds_override_and_nan_for_others():
+    pc, pts, mat, patch = holed_wall(seed=1)
+    pc.set_attr("height", pc.points[:, 2].copy())
+    pc.removePoints("mat", 9)
+    filled = pc.fillHoles(attributes=["mat", "height"], kinds={"mat": "continuous"}, others="nan")
+    new = filled.get_attr("filled") == 1
+    assert filled.has_attr("mat_std") and not filled.has_attr("mat_Pmax")
+    assert filled.has_attr("height_std")
+    # a continuous attribute equal to z is recovered from the kriged surface
+    np.testing.assert_allclose(filled.get_attr("height")[new], filled.points[new][:, 2], atol=0.5)
+    assert np.isnan(filled.get_attr("colors")[new]).all()
+    assert not np.isnan(filled.get_attr("colors")[~new]).any()
+
+
+def test_slice_ignores_a_sparse_layer_of_stray_points():
+    pts, mat = two_material_wall(n=6000)
+    rng = np.random.default_rng(7)
+    # sparse second layer 0.6 in front of the wall, plus isolated points above the crest
+    stray = np.column_stack([rng.uniform(0, 10, 120), np.full(120, 0.6), rng.uniform(0, 5, 120)])
+    above = np.column_stack([rng.uniform(0, 10, 10), np.zeros(10), np.full(10, 6.0)])
+    pc = pr.PointCloud(points=np.vstack([pts, stray, above]))
+    pc.set_attr("mat", np.r_[mat, np.zeros(130, dtype=int)])
+
+    profiles, xs = pc.slice(np.array([1.0, 0.0, 0.0]), increment=1.0, label="mat",
+                            slice_height_increment=0.3, method="walk",
+                            outlier_fraction=0.3, outlier_radius=0.15)
+    assert len(profiles) == 10
+    for prof in profiles:
+        assert np.abs(prof.nodes[:, 0]).max() < 0.2         # stays on the wall
+        assert prof.nodes[:, 1].max() < 5.1                 # does not start at a stray point
+        assert prof.nodes[:, 1].min() < 0.5
+
+    # with the filter off the walk starts from the stray points above the crest
+    raw, _ = pc.slice(np.array([1.0, 0.0, 0.0]), increment=1.0, label="mat",
+                      slice_height_increment=0.3, method="walk", outlier_fraction=0.0)
+    assert max(p.nodes[:, 1].max() for p in raw) > 5.5
+
+    # the default interpolation needs no filter
+    interp, _ = pc.slice(np.array([1.0, 0.0, 0.0]), increment=1.0, label="mat", slice_height_increment=0.3)
+    assert len(interp) == 10
+    for prof in interp:
+        assert np.abs(prof.nodes[:, 0]).max() < 0.2
+        assert prof.nodes[:, 1].max() < 5.6
+
+
+def test_slice_methods_agree_and_invalid_method_raises():
+    pts, mat = corner_wall()
+    pc = pr.PointCloud(points=pts)
+    pc.set_attr("mat", mat)
+    interp, s_i = pc.slice(increment=3.0, label="mat", slice_height_increment=0.5)
+    walk, s_w = pc.slice(increment=3.0, label="mat", slice_height_increment=0.5, method="walk")
+    np.testing.assert_allclose(s_i, s_w)
+    assert len(interp) == len(walk)
+    for a, b in zip(interp, walk):
+        # same wall: same extent in d and e, to within a node spacing
+        np.testing.assert_allclose(np.ptp(a.nodes, axis=0), np.ptp(b.nodes, axis=0), atol=0.5)
+        assert a.nodes[0, 1] > a.nodes[-1, 1]
+        assert len(a.attributes) == a.nodes.shape[0] - 1
+    with pytest.raises(ValueError, match="method must be"):
+        pc.slice(increment=3.0, label="mat", method="spline")

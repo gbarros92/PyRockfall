@@ -45,6 +45,7 @@ from pyrockfall._utils import (
     weighted_centroid,
     profile_geometry_from_nodes,
     pcWalk,
+    profile_from_slab,
     trace_polyline_nodes,
     assign_sections_from_nodes,
 )
@@ -635,3 +636,106 @@ def test_assign_sections_from_nodes_splits_points_by_projected_position():
         xs = xy[idx, 0]
         assert xs.min() >= lo - 0.5
         assert xs.max() <= hi + 0.5
+
+
+def test_pcwalk_leaves_an_isolated_start_point():
+    # A stray start point further than the step from every other point used to
+    # give a zero-length step, so the walk stood still until the node limit.
+    y = np.linspace(10.0, 0.0, 101)
+    xy = np.column_stack([np.zeros_like(y), y])
+    xy = np.vstack([[0.0, 10.8], xy])                  # stray point 0.8 above the top, step 0.5
+    path = pcWalk(xy[0], xy[-1], xy, dlt_x=np.full(xy.shape[0], 0.5), dlt_z=0.5)
+    np.testing.assert_allclose(path[-1], xy[-1])       # reaches the end
+    assert path.shape[0] < 60                          # in a sensible number of steps
+    assert np.all(np.linalg.norm(np.diff(path, axis=0), axis=1) > 0)
+
+
+# ---------------------------------------------------------------------------
+# profile_from_slab: profile by interpolation over the face direction
+# ---------------------------------------------------------------------------
+
+def _bench_profile(x):
+    """Height of a wall with a 60 degree face, a 3 m bench at mid-height and a floor.
+    x is the horizontal distance; the crest is at x = 0."""
+    t = np.tan(np.radians(60.0))
+    return np.select(
+        [x < 0, x < 5, x < 8, x < 13],
+        [20.0, 20.0 - t * x, 20.0 - t * 5, 20.0 - t * 5 - t * (x - 8)],
+        default=20.0 - t * 10,
+    )
+
+
+def _bench_slab(n=6000, seed=0, noise=0.02):
+    rng = np.random.default_rng(seed)
+    x = rng.uniform(-3.0, 18.0, n)
+    pts = np.column_stack([x, _bench_profile(x) + noise * rng.standard_normal(n)])
+    return pts
+
+
+_FACE_AXIS = np.array([-np.cos(np.radians(60.0)), np.sin(np.radians(60.0))])   # up the 60 degree face
+
+
+def _distance_to_bench(nodes):
+    """Vertical distance of each node from the true profile."""
+    return np.abs(nodes[:, 1] - _bench_profile(nodes[:, 0]))
+
+
+@pytest.mark.parametrize("refine", [True, False])
+def test_profile_from_slab_recovers_a_benched_wall(refine):
+    pts = _bench_slab()
+    nodes = profile_from_slab(pts, 0.5, _FACE_AXIS, refine=refine)
+    assert nodes.ndim == 2 and nodes.shape[1] == 2
+    assert nodes[0, 1] > nodes[-1, 1]                              # crest to toe
+    assert np.all(np.diff(nodes[:, 0]) > 0)                        # ordered, no back-tracking
+    # away from the three corners the nodes are on the surface
+    corner = np.min(np.abs(nodes[:, [0]] - np.array([[0.0, 5.0, 8.0, 13.0]])), axis=1) < 0.6
+    assert np.median(_distance_to_bench(nodes[~corner])) < 0.05
+    assert _distance_to_bench(nodes[~corner]).max() < 0.3
+    # spans the slab
+    assert nodes[0, 0] < -2.5 and nodes[-1, 0] > 17.5
+    assert np.ptp(nodes[:, 1]) > 0.98 * np.ptp(pts[:, 1])
+
+
+def test_profile_from_slab_refine_evens_out_the_node_spacing():
+    pts = _bench_slab()
+    spacing = lambda nodes: np.linalg.norm(np.diff(nodes, axis=0), axis=1)
+    plain = spacing(profile_from_slab(pts, 0.5, _FACE_AXIS, refine=False))
+    fine = spacing(profile_from_slab(pts, 0.5, _FACE_AXIS, refine=True))
+    # the floor and bench are 60 degrees off the face axis: nodes spread out without the second pass
+    assert plain.max() > 0.9
+    assert fine.max() < 0.75
+    assert fine.max() < plain.max()
+
+
+def test_profile_from_slab_ignores_stray_points():
+    pts = _bench_slab()
+    rng = np.random.default_rng(3)
+    x = rng.uniform(8.0, 18.0, 150)
+    layer = np.column_stack([x, _bench_profile(x) + 0.5])           # sparse layer 0.5 above the surface
+    above = np.column_stack([rng.uniform(-3.0, -2.0, 4), np.full(4, 21.0)])   # isolated points above the crest
+    clean = profile_from_slab(pts, 0.5, _FACE_AXIS)
+    dirty = profile_from_slab(np.vstack([pts, layer, above]), 0.5, _FACE_AXIS)
+    assert dirty[:, 1].max() < 20.2                                 # does not start at a stray point
+    corner = np.min(np.abs(dirty[:, [0]] - np.array([[0.0, 5.0, 8.0, 13.0]])), axis=1) < 0.6
+    assert _distance_to_bench(dirty[~corner]).max() < 0.3
+    assert abs(dirty.shape[0] - clean.shape[0]) <= 2
+
+
+def test_profile_from_slab_bridges_a_gap():
+    pts = _bench_slab()
+    pts = pts[(pts[:, 0] < 1.5) | (pts[:, 0] > 3.5)]                # 2 m of the upper face missing
+    nodes = profile_from_slab(pts, 0.5, _FACE_AXIS)
+    assert nodes[0, 0] < -2.5 and nodes[-1, 0] > 17.5               # still crest to toe
+    assert not np.any((nodes[:, 0] > 1.6) & (nodes[:, 0] < 3.4))    # no nodes invented in the gap
+    assert np.linalg.norm(np.diff(nodes, axis=0), axis=1).max() > 3.0   # one segment spans it
+
+
+def test_profile_from_slab_degenerate_input():
+    assert profile_from_slab(np.empty((0, 2)), 0.5, _FACE_AXIS).shape == (0, 2)
+    one = profile_from_slab(np.array([[1.0, 2.0]]), 0.5, _FACE_AXIS)
+    assert one.shape[0] < 2
+    with pytest.raises(ValueError, match="step must be > 0"):
+        profile_from_slab(_bench_slab(n=50), 0.0, _FACE_AXIS)
+    # min_count drops thin bins
+    sparse = _bench_slab(n=60)
+    assert profile_from_slab(sparse, 0.5, _FACE_AXIS, min_count=4).shape[0] < profile_from_slab(sparse, 0.5, _FACE_AXIS).shape[0]
