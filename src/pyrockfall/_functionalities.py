@@ -758,6 +758,80 @@ def aggregateOnFloor(
 
     return outputs
 
+def wallFloorElevation(
+    model: Model,
+    profile_spacing: float,
+    *,
+    label: Optional[str] = None,
+    ignore_ids: List[int] = [],
+    frame=None,
+) -> float:
+    """
+    Common floor elevation for all profiles of a wall.
+
+    The wall is cut into slabs of width `profile_spacing` along the strike (the
+    ``s`` coordinate of the curvilinear frame). Slabs that do not span the full
+    height of the wall are ignored; the floor is the highest of the lowest
+    elevations of the remaining slabs, so every complete profile reaches it.
+
+    Parameters
+    ----------
+    model : Model
+        Wall geometry.
+    profile_spacing : float
+        Width of the slabs along the strike.
+    label : str, optional
+        Attribute holding material IDs. Needed only with `ignore_ids`.
+    ignore_ids : list[int], optional
+        Material IDs left out when looking for the floor (e.g. talus). Their
+        elevation range sets the tolerance used to decide whether a slab is
+        complete; without them the tolerance is `profile_spacing`.
+    frame : CurvilinearFrame, optional
+        Frame to use. Defaults to the frame of the model.
+
+    Returns
+    -------
+    float
+        Floor elevation.
+    """
+    frame = model.frame if frame is None else frame
+    sde = frame.xyz_to_sde(model.points)
+    ok = np.isfinite(sde).all(axis=1)
+    s, e = sde[ok, 0], sde[ok, 2]
+
+    delta = profile_spacing
+    if label is not None and len(ignore_ids) > 0:
+        mat = np.asarray(model.get_attr(label))
+        if mat.ndim == 2 and mat.shape[1] == 1:
+            mat = mat[:, 0]
+        if mat.shape[0] != model.points.shape[0]:
+            # per-triangle labels: give each point the label of a triangle around it
+            tri = model.triangles
+            point_mat = np.full(model.points.shape[0], -1, dtype=mat.dtype)
+            point_mat[tri.ravel()] = np.repeat(mat, 3)
+            mat = point_mat
+        mat = mat[ok]
+        for m_id in ignore_ids:
+            ignored = mat == m_id
+            if ignored.any():
+                delta = float(e[ignored].max() - e[ignored].min())
+            s, e, mat = s[~ignored], e[~ignored], mat[~ignored]
+    if e.size == 0:
+        raise ValueError("No points left to find the floor elevation.")
+
+    e_max, e_min = float(e.max()), float(e.min())
+    k = np.floor((s - s.min()) / profile_spacing).astype(np.int64)
+    order = np.argsort(k, kind="stable")
+    k_sorted, e_sorted = k[order], e[order]
+    starts = np.r_[0, 1 + np.flatnonzero(np.diff(k_sorted))]
+    top = np.maximum.reduceat(e_sorted, starts)
+    bottom = np.minimum.reduceat(e_sorted, starts)
+    complete = (top >= e_max - delta) & (bottom <= e_min + delta)  # ignore incomplete slabs
+    if not complete.any():
+        return e_min
+    return float(max(e_min, bottom[complete].max()))
+
+
 def runWallProfiles(
     model: Model,
     segment_length: float,
@@ -782,8 +856,9 @@ def runWallProfiles(
     - **Floor point cloud**: points at the floor with direction vectors, representing the
       projection of block trajectories to the base of the slope.
 
-    The geometry is temporarily rotated so the wall aligns with the X axis for processing,
-    and then rotated back to its original orientation before returning.
+    Profiles are slices of constant ``s`` in the curvilinear frame of the model (see
+    :meth:`Model.sde`), so they follow the strike of the wall around bends. The model
+    itself is not modified.
 
     Args:
         model (Geometry):
@@ -826,10 +901,9 @@ def runWallProfiles(
             - mismatch in number of positions and results.
 
     Notes:
-        - The function aligns the slope with the X axis for slicing and re-aligns it back
-          after processing.
+        - Profile coordinates are (d, e): distance along the dip direction and elevation.
         - Profiles containing incomplete or ambiguous talus sections are skipped.
-        - The returned point clouds are rotated back to the model's original orientation.
+        - The returned point clouds are in the model's own coordinates.
 
     Example:
         >>> pc_wall, pc_floor = runWallProfiles(
@@ -850,10 +924,6 @@ def runWallProfiles(
         >>> pc_floor.get_attr("direction").shape
         (100, 3)
     """
-    # Store original orientation for rotating back later
-    dip_dir = model.dipDirection()
-    centroid = model.centroid()
-
     # Get talus ID for removing talus from profiles
     talus_id = -1
     if do_remove_talus:
@@ -862,67 +932,44 @@ def runWallProfiles(
                 talus_id = key
                 break
 
-    # Align wall with x axis
-    model.alignWithX(sense=-1)
+    # Curvilinear frame: s along the strike, d down-dip, e elevation
+    frame = model.frame
 
     # Create a common floor for all profiles by finding the minimum z value in the wall excluding talus
-    pmin, pmax = model.boundingBox()
-    points = model.points.copy()
-    points_talus = points[model.get_attr(material_label) == talus_id]
-    points = points[model.get_attr(material_label) != talus_id]
-    if points_talus.size == 0:
-        delta_remove = profile_spacing
+    min_z = wallFloorElevation(
+        model, profile_spacing, label=material_label, ignore_ids=[talus_id], frame=frame
+    )
+
+    # Work on a copy without the points below the common floor
+    keep = model.points[:, 2] >= min_z
+    if isinstance(model, Mesh):
+        wall = Mesh(points=model.points.copy(), triangles=model.triangles.copy(), attrs=dict(model.attrs))
     else:
-        delta_remove = points_talus[:,2].max() - points_talus[:,2].min()
-    max_z_pts = points[:,2].max()
-    min_z_pts = points[:,2].min()
-    min_z = min_z_pts
-    for x in np.arange(pmin[0]+profile_spacing/2, pmax[0], profile_spacing):
-        mask = (points[:,0] >= x-profile_spacing/2) & (points[:,0] < x+profile_spacing/2)
-        points_in_slice = points[mask]
-        if points_in_slice.size == 0:
-            continue
-        max_z_slice = points_in_slice[:,2].max()
-        if max_z_slice < max_z_pts - delta_remove:
-            continue  # Ignore incomplete slices
-        min_z_slice = points_in_slice[:,2].min()
-        if min_z_slice > min_z_pts + delta_remove:
-            continue  # Ignore incomplete slices
-        min_z = max(min_z, min_z_slice)
-    pmin[2] = min_z  # Set minimum z value to the lowest point in
-    model.clip(pmin, pmax)  # Clip wall to remove points below the minimum z value
+        wall = PointCloud(points=model.points.copy(), attrs=dict(model.attrs))
+    wall.frame = frame
+    wall.apply_point_mask_(keep)
 
-    # Re-align wall with x axis after clipping
-    dip_dir += model.dipDirection()
-    dip_dir = dip_dir % 360
-    model.alignWithX(sense=-1)
-
-    # Store positions from where blocks are released
+    # Store positions from where blocks are released, as (s, d, e)
     X_wall = []
     Y_wall = []
     Z_wall = []
 
-    # Store positions on the floor
+    # Store positions on the floor, as (s, d)
     X_floor = []
     Y_floor = []
-    dX_floor = []
-    dY_floor = []
 
     # Store results on the wall
     results_wall = []
     num_results = -1 if len(results_labels) == 0 else len(results_labels)
 
-    for seg in model.segment(segment_length):
-        # Store original orientation for rotating back later
-        dip_dir_seg = seg.dipDirection()
-        seg.alignWithX(sense=-1)
-
-        # Extracts profiles from the wall segment
+    for seg in wall.segment(segment_length):
+        # Extracts profiles from the wall segment: slices of constant s, nodes in (d, e)
         profiles, x_profiles = seg.slice(
-            np.array([1.0, 0.0, 0.0]),
+            None,
             profile_spacing,
             slice_height_increment=profile_resolution,
-            label=material_label
+            label=material_label,
+            frame=frame,
         )
 
         # Store positions from where blocks are released
@@ -933,8 +980,6 @@ def runWallProfiles(
         # Store positions on the floor
         X_floor_seg = []
         Y_floor_seg = []
-        dX_floor_seg = []
-        dY_floor_seg = []
 
         # Loop over profiles
         for prof, x_prof in zip(profiles, x_profiles):
@@ -1019,77 +1064,46 @@ def runWallProfiles(
             Y_seg.append(positions_prof[mask,0] + x_centre)
             Z_seg.append(positions_prof[mask,1] + y_centre)
 
-            # Store position and direction on the floor from this profile to the segment
+            # Store position on the floor from this profile to the segment
             X_floor_seg.append(x_prof)
             Y_floor_seg.append(x_centre)
-            dX_floor_seg.append(0)
-            dY_floor_seg.append(1)
 
-        # Rotate segment back to original orientation
-        def rotateSegBack(x, y, centre=(0,0)):
-            x = np.asarray(x, float) - centre[0]
-            y = np.asarray(y, float) - centre[1]
-            c, s = np.cos(np.radians(-dip_dir_seg)), np.sin(np.radians(-dip_dir_seg))
-            x_rot =  c * x - s * y + centre[0]
-            y_rot =  s * x + c * y + centre[1]
-            return x_rot, y_rot
-        
         if len(X_seg) == 0:
             continue  # No results obtained in this segment
 
-        X_seg = np.concatenate(X_seg)
-        Y_seg = np.concatenate(Y_seg)
-        Z_seg = np.concatenate(Z_seg)
-        X_seg, Y_seg = rotateSegBack(X_seg, Y_seg, seg.centroid())
-        dX_floor_seg, dY_floor_seg = rotateSegBack(dX_floor_seg, dY_floor_seg)
+        X_floor.append(np.asarray(X_floor_seg, float))
+        Y_floor.append(np.asarray(Y_floor_seg, float))
 
-        X_floor.append(np.asarray(X_floor_seg))
-        Y_floor.append(np.asarray(Y_floor_seg))
-        dX_floor.append(dX_floor_seg)
-        dY_floor.append(dY_floor_seg)
-
-        X_wall.append(X_seg)
-        Y_wall.append(Y_seg)
-        Z_wall.append(Z_seg)
+        X_wall.append(np.concatenate(X_seg))
+        Y_wall.append(np.concatenate(Y_seg))
+        Z_wall.append(np.concatenate(Z_seg))
     
     if len(X_wall) == 0:
         raise ValueError("No results obtained from any profile.")
         
-    # Consolidate arrays
-    X_wall = np.concatenate(X_wall)
-    Y_wall = np.concatenate(Y_wall)
-    Z_wall = np.concatenate(Z_wall)
+    # Consolidate arrays: release points in (s, d, e)
+    sde_wall = np.column_stack([np.concatenate(X_wall), np.concatenate(Y_wall), np.concatenate(Z_wall)])
     results_wall = np.concatenate(results_wall)
 
-    # Create grid on the floor
-    X_floor = np.concatenate(X_floor)
-    Y_floor = np.concatenate(Y_floor)
-    dX_floor = np.concatenate(dX_floor)
-    dY_floor = np.concatenate(dY_floor)
+    # Points on the floor, at the toe of each profile
+    s_floor = np.concatenate(X_floor)
+    d_floor = np.concatenate(Y_floor)
+    sde_floor = np.column_stack([s_floor, d_floor, np.full_like(s_floor, min_z)])
 
-    pc_wall = PointCloud(np.column_stack([X_wall, Y_wall, Z_wall]))
+    # Back to the model's coordinates through the frame
+    pc_wall = PointCloud(frame.sde_to_xyz(sde_wall))
     for i in range(num_results):
         pc_wall.set_attr(results_labels[i], results_wall[:,i])
 
-    points = np.column_stack([X_floor, Y_floor, np.full_like(X_floor, min_z)])
+    points = frame.sde_to_xyz(sde_floor)
     pc_floor = PointCloud(points)
-    pc_floor.set_attr('direction', np.column_stack([dX_floor, dY_floor, np.zeros_like(dX_floor)]))
 
-    # Rotate wall back to original orientation
-    model.translate(-centroid)
-    model.rotate(-dip_dir, 'z')
-    model.translate(centroid)
+    # Direction on the floor: horizontal, away from the wall (increasing d)
+    ahead = frame.sde_to_xyz(sde_floor + np.array([0.0, 1.0, 0.0]))
+    direction = ahead - points
+    direction /= np.maximum(np.linalg.norm(direction, axis=1, keepdims=True), 1e-12)
+    pc_floor.set_attr('direction', direction)
 
-    # Rotate points on wall to original orientation
-    pc_wall.translate(-centroid)
-    pc_wall.rotate(-dip_dir, 'z')
-    pc_wall.translate(centroid)
-
-    # Rotate points on floor back to original orientation
-    pc_floor.translate(-centroid)
-    pc_floor.rotate(-dip_dir, 'z')
-    pc_floor.translate(centroid)
-    
     return pc_wall, pc_floor
 
 
