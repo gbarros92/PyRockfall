@@ -27,10 +27,10 @@ except Exception:  # pragma: no cover
 from ._model import Model
 from ._geometry import Geometry
 from ._geometry3d import Geometry3D
+from ._frame import CurvilinearFrame
 from ._utils import (
     getSubMesh,
     triangleCentroids,
-    rotationAlign2x,
     build_neighbours_mesh,
     tri_plane_intersections_yz_per_triangle
 )
@@ -168,6 +168,79 @@ class Mesh(Model):
                 continue
             if arr.shape[0] != num_points:
                 self.del_attr(k)
+        self._invalidate_caches()
+
+    def apply_point_mask_(self, mask: np.ndarray) -> None:
+        """
+        Keep only points[mask]. Triangles that reference a dropped point are
+        removed and the remaining connectivity is reindexed. Per-point and
+        per-triangle attributes are kept consistent.
+        """
+        mask = np.asarray(mask, dtype=bool)
+        V = self.points
+        T = self.triangles
+        N, E = V.shape[0], T.shape[0]
+        if mask.shape != (N,):
+            raise ValueError("Mask must be boolean with length N points.")
+
+        keep_tri = mask[T].all(axis=1) if E else np.zeros(0, dtype=bool)
+        new_index = np.cumsum(mask) - 1
+        new_T = new_index[T[keep_tri]].astype(np.int32).reshape(-1, 3)
+
+        attrs: dict[str, np.ndarray] = {}
+        for k, arr in self._attrs.items():
+            if arr.shape[0] == E:
+                attrs[k] = arr[keep_tri]
+            elif arr.shape[0] == N:
+                attrs[k] = arr[mask]
+
+        # A subset lives in the same space: keep the frame and removed positions
+        frame, removed = self._frame, self._removed
+        self._points = V[mask]
+        self._triangles = new_T
+        self._attrs = attrs
+        self._invalidate_caches()
+        self._frame, self._removed = frame, removed
+
+    def _steep_mask(self, max_nz: float = 0.7) -> Optional[NDArray[np.bool_]]:
+        """
+        Points on the face rather than on the floor or berms. Uses the
+        ``"normals"`` attribute if present, otherwise the triangles around each
+        point (area-weighted, independent of the triangle winding).
+        """
+        mask = super()._steep_mask(max_nz)
+        if mask is not None:
+            return mask
+        V = self.points
+        T = self.triangles
+        if V.size == 0 or T.size == 0:
+            return None
+        fn = np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]])  # 2 * area * normal
+        area = np.linalg.norm(fn, axis=1)
+        ids = T.ravel()
+        tot = np.bincount(ids, weights=np.repeat(area, 3), minlength=V.shape[0])
+        vert = np.bincount(ids, weights=np.repeat(np.abs(fn[:, 2]), 3), minlength=V.shape[0])
+        return (tot > 0) & (vert < max_nz * tot)
+
+    def _triangle_strike(self) -> NDArray[np.float64]:
+        """``s`` coordinate of each triangle centroid (NaN if any vertex is NaN)."""
+        s = self.frame.xyz_to_sde(self.points)[:, 0]
+        return s[self.triangles].mean(axis=1)
+
+    def _submesh(self, ids: np.ndarray) -> "Mesh":
+        """New mesh with the given triangles, their points and all attributes."""
+        V = self.points
+        T = self.triangles
+        N, E = V.shape[0], T.shape[0]
+        v_sub, e_sub, vertex_ids = getSubMesh(V, T, ids)
+        sub = Mesh(points=v_sub, triangles=e_sub)
+        for k, arr in self._attrs.items():
+            if arr.shape[0] == E:
+                sub._attrs[k] = arr[ids]
+            elif arr.shape[0] == N:
+                sub._attrs[k] = arr[vertex_ids]
+        sub._frame = self._frame  # a subset lives in the same space
+        return sub
 
     # ----------------------------
     # Persistence hooks (used by Geometry.save/load)
@@ -225,98 +298,80 @@ class Mesh(Model):
     # Higher-level operations
     # ----------------------------
     def segment(self, dx: float, du: float = 0.0) -> List["Mesh"]:
-        """Split the mesh along the **x** axis into slabs based on triangle centroids.
+        """Split the mesh along the strike into windows of length ``dx``.
 
-        Triangles are assigned to a bin using the x-coordinate of their centroid,
-        and each bin becomes an independent submesh.
+        Triangles are assigned to a window using the ``s`` coordinate of their
+        centroid in the curvilinear frame (see :meth:`Model.sde`), so the windows
+        follow the wall around bends. Each window becomes an independent submesh
+        that keeps the attributes and shares the frame of this mesh.
 
         Args:
-            dx: Target slab width along x (must be ``> 0``).
-            du: Overlap parameter (reserved/not used).
+            dx: Window length along the strike (must be ``> 0``).
+            du: Overlap between consecutive windows (``0 <= du < dx``).
 
         Returns:
-            list[Mesh]: Independent submeshes (0 or more).
+            list[Mesh]: Independent submeshes (0 or more), ordered by increasing ``s``.
         """
         if dx <= 0:
             raise ValueError("dx must be > 0.")
+        if du < 0 or du >= dx:
+            raise ValueError("du must satisfy 0 <= du < dx.")
 
         V = self.points
         T = self.triangles
         if V.size == 0 or T.size == 0:
             return []
 
-        cent = triangleCentroids(V, T)  # (E, 3)
-        cx = cent[:, 0]
-        x_min, x_max = float(np.min(cx)), float(np.max(cx))
-        if not np.isfinite([x_min, x_max]).all() or x_max <= x_min:
+        s = self.frame.xyz_to_sde(V)[:, 0]
+        cs = s[T].mean(axis=1)  # (E,)
+        ok = np.isfinite(cs)
+        if not ok.any():
+            return []
+        s_min, s_max = float(np.nanmin(s)), float(np.nanmax(s))
+        if not np.isfinite([s_min, s_max]).all() or s_max <= s_min:
             return []
 
-        n_bins = int(np.ceil((x_max - x_min) / dx))
         out: List[Mesh] = []
-        for i in range(n_bins):
-            x0 = x_min + i * dx
-            x1 = min(x0 + dx, x_max + 1e-12)
-            mask = (cx >= x0) & ((cx < x1) if i < n_bins - 1 else (cx <= x1))
+        for s0 in np.arange(s_min, s_max, dx - du):
+            s1 = s0 + dx
+            mask = ok & (cs >= s0) & ((cs < s1) if s1 < s_max else (cs <= s_max))
             ids = np.nonzero(mask)[0]
             if ids.size == 0:
                 continue
-
-            v_sub, e_sub, _ = getSubMesh(V, T, ids)  # reindexed vertices/connectivity
-            out.append(Mesh(points=v_sub, triangles=e_sub))
+            out.append(self._submesh(ids))
         return out
 
     def split(self, dx: float = 0.5, minPerc: float = 0.05) -> List["Mesh"]:
-        """Split the mesh into **two** parts by cutting at a percentile of centroid x.
+        """Split the mesh into **two** parts at the sharpest bend of the wall.
 
-        The method scans candidate cuts on ``x`` with step ``dx`` and chooses the
-        most balanced split that leaves at least ``minPerc`` fraction of triangles
-        on each side.
+        The cut is made at the vertex of the frame's polyline with the largest
+        turning angle that leaves at least ``minPerc`` of the triangles on each
+        side. A wall without a bend is cut at the median ``s`` of the triangle
+        centroids, which balances the two parts.
 
         Args:
-            dx: Granularity for scanning the cut (default ``0.5``).
+            dx: Unused; kept for backward compatibility.
             minPerc: Minimum fraction of triangles per side (default ``0.05``).
 
         Returns:
-            list[Mesh]: ``[left_mesh, right_mesh]`` (or empty list if no valid split).
+            list[Mesh]: ``[before, after]`` along increasing ``s`` (or an empty
+            list if no valid split exists).
         """
         V = self.points
         T = self.triangles
         if V.size == 0 or T.size == 0:
             return []
 
-        cent = triangleCentroids(V, T)
-        cx = cent[:, 0]
-        x_min, x_max = float(np.min(cx)), float(np.max(cx))
-        if not np.isfinite([x_min, x_max]).all() or x_max <= x_min:
+        cs = self._triangle_strike()
+        s_cut = self._split_position(cs, minPerc)
+        if not np.isfinite(s_cut):
             return []
 
-        E = T.shape[0]
-        min_e = int(np.ceil(minPerc * E))
-
-        best_score = np.inf
-        best_left: Optional[NDArray[np.int64]] = None
-        n_steps = max(1, int(np.ceil((x_max - x_min) / max(dx, 1e-12))))
-
-        for i in range(1, n_steps):  # skip extremes
-            x_cut = x_min + i * dx
-            left = np.nonzero(cx <= x_cut)[0]
-            right = np.nonzero(cx > x_cut)[0]
-            if left.size < min_e or right.size < min_e:
-                continue
-            score = abs(left.size - right.size)
-            if score < best_score:
-                best_score = score
-                best_left = left
-
-        if best_left is None:
+        left_ids = np.nonzero(cs <= s_cut)[0]
+        right_ids = np.nonzero(cs > s_cut)[0]
+        if left_ids.size == 0 or right_ids.size == 0:
             return []
-
-        left_ids = best_left
-        right_ids = np.setdiff1d(np.arange(E, dtype=np.int64), left_ids, assume_unique=True)
-
-        vL, eL, _ = getSubMesh(V, T, left_ids)
-        vR, eR, _ = getSubMesh(V, T, right_ids)
-        return [Mesh(points=vL, triangles=eL), Mesh(points=vR, triangles=eR)]
+        return [self._submesh(left_ids), self._submesh(right_ids)]
 
     def slopeGeometry(
         self,
@@ -636,19 +691,77 @@ class Mesh(Model):
             self.set_attr(out, point_vals)
         return point_vals
 
-    def slice(
+    def section(
         self,
-        direction: NDArray[np.floating],   # ignored here; assume coords already aligned
         increment: float,
         label: str,
+        *,
+        frame: Optional[CurvilinearFrame] = None,
+        **kwargs,
+    ):
+        """Extract 2D profiles along the strike of the mesh, and their points in 3D.
+
+        Each section is the exact cut of the triangles by a surface of constant
+        ``s`` of the curvilinear frame (see :meth:`slice`), so every node lies on
+        a triangle edge and every segment carries the material of the triangle it
+        crosses. The mesh itself is not modified.
+
+        Args:
+            increment: Spacing between consecutive sections along the strike. A
+                section must not pass exactly through mesh vertices; change the
+                spacing slightly if :meth:`slice` reports that.
+            label: Name of the attribute containing material IDs (per point or
+                per triangle).
+            frame: Frame to slice in. Defaults to the frame of the mesh.
+
+        Returns:
+            profiles: One 2D :class:`Geometry` per section, crest to toe, with
+            nodes as (horizontal distance from the crest node, height above the
+            lowest node) and material IDs per segment.
+
+            sections_pc: A :class:`PointCloud` with all section nodes in the
+            mesh's coordinates, the material attribute (``label``) and a
+            ``"Profile"`` attribute numbering the sections.
+
+        Raises:
+            ValueError: If no valid sections are found.
+        """
+        return super().section(increment, label, frame=frame, **kwargs)
+
+    def slice(
+        self,
+        direction: Optional[NDArray[np.floating]] = None,
+        increment: Optional[float] = None,
+        label: Optional[str] = None,
+        *,
+        frame: Optional[CurvilinearFrame] = None,
         **kwargs,
     ) -> Tuple[List[Geometry], NDArray]:
         """
         Per-triangle slicing with a simple local-walk ordering.
-        Assumes points are already in an aligned frame where slice planes are x = xs.
-        Returns 2D nodes in the slice plane (y, z). Segment labels come from triangle materials.
+
+        By default the slices follow the strike of the wall: they are surfaces of
+        constant ``s`` of the curvilinear frame (see :meth:`Model.sde`) and the
+        returned 2D nodes are ``(d, e)``. With a ``direction`` the slices are
+        parallel planes normal to it and the nodes are the two remaining axes of
+        the points rotated so that ``direction`` is +X.
+
+        Segment labels come from triangle materials. Triangles are intersected in
+        the slicing coordinates, where a triangle spanning a bend of the wall is
+        only approximately planar (the error is second order in its size).
+
+        Args:
+            direction: ``None`` to slice along the strike, or a fixed direction.
+            increment: Spacing between consecutive slices.
+            label: Name of the attribute containing material IDs (per point or
+                per triangle).
+            frame: Frame to slice in. Defaults to the frame of the mesh.
+
+        Returns:
+            Profiles as :class:`Geometry` objects and the slice positions (``s``,
+            or the distance along ``direction``).
         """
-        V = self.points              # (N,3) aligned coords: columns [x, y, z]
+        V = self.points              # (N,3)
         T = self.triangles           # (E,3)
         E = T.shape[0]
         if V.size == 0 or E == 0:
@@ -674,18 +787,16 @@ class Mesh(Model):
         if np.any(bad):
             raise ValueError(f"Triangle material IDs out of range: {np.unique(tri_labels[bad]).tolist()}.")
 
-        if increment <= 0:
+        if increment is None or increment <= 0:
             raise ValueError("increment must be > 0.")
-        
-        R = rotationAlign2x(direction)
-        centre = V.mean(axis=0, keepdims=True)  # (1,3)
-        V = (V - centre) @ R.T
-        centre = centre @ R.T
-        centre_x = centre[0, 0]
-        centre = centre[0, 1:]
 
-        # --- slice positions along x (aligned frame)
-        x_min, x_max = float(np.min(V[:, 0])), float(np.max(V[:, 0]))
+        # --- slicing coordinates: column 0 is constant on a slice
+        V, _ = self._slicing_coords(direction, frame)
+        if not np.isfinite(V[:, 0]).any():
+            return [], np.array([], dtype=float)
+
+        # --- slice positions along x (slicing coordinates)
+        x_min, x_max = float(np.nanmin(V[:, 0])), float(np.nanmax(V[:, 0]))
         if not np.isfinite(x_max - x_min) or x_max <= x_min:
             return [], np.array([], dtype=float)
         x_positions = np.arange(x_min + increment/2.0, x_max, increment, dtype=float)
@@ -694,6 +805,10 @@ class Mesh(Model):
         neighbours = build_neighbours_mesh(T)
 
         tri_coords = V[T]                 # (E,3,3)
+        # Never walk into a triangle with a point outside the frame (NaN)
+        tri_ok = np.isfinite(tri_coords).all(axis=(1, 2))
+        if not tri_ok.all():
+            neighbours = np.where((neighbours >= 0) & ~tri_ok[neighbours], -1, neighbours)
         tri_centroids = tri_coords.mean(axis=1)  # (E,3)
         tri_min = tri_coords.min(axis=1)  # (E,3)
         tri_max = tri_coords.max(axis=1)  # (E,3)
@@ -716,8 +831,21 @@ class Mesh(Model):
         init_idx[nohit] = -1
         current_idx = np.array(init_idx, copy=True)
 
+        def _check_walk(steps: int) -> None:
+            # A walk can visit each triangle at most once; more means it is going
+            # round in circles, which happens when a slice passes exactly through
+            # mesh vertices.
+            if steps > E:
+                raise ValueError(
+                    "Slice walk did not terminate: a slice passes exactly through mesh "
+                    "vertices. Change `increment` slightly."
+                )
+
         # LEFT walk
+        steps = 0
         while np.any(current_idx >= 0):
+            steps += 1
+            _check_walk(steps)
             good = current_idx >= 0
             if not np.any(good):
                 break
@@ -735,7 +863,10 @@ class Mesh(Model):
 
         # RIGHT walk
         current_idx = np.array(init_idx, copy=True)
+        steps = 0
         while np.any(current_idx >= 0):
+            steps += 1
+            _check_walk(steps)
             good = current_idx >= 0
             if not np.any(good):
                 break
@@ -765,6 +896,6 @@ class Mesh(Model):
                 raise ValueError("Invalid profile")
             if nodes_i.shape[0] != elements_i.shape[0] + 1:
                 raise ValueError("Invalid profile")
-            profiles.append(Geometry(nodes=nodes_i+centre, elements=elements_i, attributes=tri_labels[elements_i]))
+            profiles.append(Geometry(nodes=nodes_i, attributes=tri_labels[elements_i]))
 
-        return profiles, x_positions + centre_x
+        return profiles, x_positions
