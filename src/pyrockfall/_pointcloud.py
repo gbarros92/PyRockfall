@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple, List, Mapping, Optional
+from typing import Tuple, List, Mapping, Optional, Sequence, Dict
 from numpy.typing import NDArray
 
 import numpy as np
+from scipy.spatial import cKDTree
 from sklearn.neighbors import NearestNeighbors, RadiusNeighborsClassifier, KNeighborsClassifier
 
 try:
@@ -17,7 +18,9 @@ ArrayF = NDArray[np.float64]
 
 from ._model import Model
 from ._geometry import Geometry
-from ._utils import rotationAlign2x, pcWalk, trace_polyline_nodes, assign_sections_from_nodes
+from ._frame import CurvilinearFrame
+from ._kriging import fill_holes_uv, _class_label
+from ._utils import pcWalk, profile_from_slab
 
 class PointCloud(Model):
     """
@@ -162,100 +165,80 @@ class PointCloud(Model):
     # ----------------------------
     def segment(self, ds: float, du: float = 0.0) -> List["PointCloud"]:
         """
-        Split along arclength into contiguous windows of width `ds`.
+        Split along the strike into contiguous windows of length `ds`.
+
+        The windows are taken on the ``s`` coordinate of the curvilinear frame
+        (see :meth:`Model.sde`), so they follow the wall around bends.
+
+        Parameters
+        ----------
+        ds : float
+            Window length along the strike.
+        du : float, default 0
+            Overlap between consecutive windows (``0 <= du < ds``).
 
         Returns
         -------
         list[PointCloud]
+            One point cloud per non-empty window, ordered by increasing ``s``.
+            They share the frame of this point cloud.
         """
-        x0, y0, height, radius = self.coneApproximation()
-        if radius == 0:
-            raise ValueError('Zero radius found in cone approximation.')
+        if ds <= 0:
+            raise ValueError("ds must be > 0.")
+        if du < 0 or du >= ds:
+            raise ValueError("du must satisfy 0 <= du < ds.")
+        if self.points.shape[0] == 0:
+            return []
 
-        v = self.points.copy()
-        x = v[:, 0] - x0
-        y = v[:, 1] - y0
-        z = v[:, 2] - v.min(axis=0)[2]
+        s = self.frame.xyz_to_sde(self.points)[:, 0]
+        idx = np.flatnonzero(np.isfinite(s))
+        if idx.size == 0:
+            return []
+        order = idx[np.argsort(s[idx], kind="stable")]
+        ss = s[order]
 
-        if height < 0:
-            radius *= 1 - z.max() / height
-
-        # Find new polar coords
-        r = np.hypot(x, y)
-        theta = np.arctan2(y, x)
-
-        # reorder
-        order = np.argsort(theta)
-        theta = theta[order]
-        r = r[order]
-        v = v[order]
-
-        # Divide in segments
-        tot_len = radius * (theta[-1] - theta[0])
-        dt = ds / radius
-        du = du / radius
-        step = dt - du
-        t0 = np.arange(theta[0], theta[-1] + 1e-12, step)
-        t1 = t0 + dt
-        mask = t0 < tot_len - 1e-12
-        t0, t1 = t0[mask], t1[mask]
-
-        start_idx = np.searchsorted(theta, t0, side="left")
-        end_idx   = np.searchsorted(theta, np.minimum(t1, theta[-1]), side="left")
-
-        good = end_idx > start_idx
-        start_idx = start_idx[good]
-        end_idx = end_idx[good]
+        t0 = np.arange(ss[0], ss[-1], ds - du)
+        if t0.size == 0:
+            t0 = np.array([ss[0]])
+        t1 = t0 + ds
+        start = np.searchsorted(ss, t0, side="left")
+        end = np.searchsorted(ss, t1, side="left")
+        end[t1 >= ss[-1]] = ss.size  # the last window includes the end of the wall
 
         out: List[PointCloud] = []
-        for s, e in zip(start_idx, end_idx):
-            idx = np.array([order[i] for i in range(s, e)], dtype=int)
-            seg = self._from_indices(idx)
-            for k, arr in self.attrs.items():
-                seg.set_attr(k, arr[idx] if arr.ndim == 1 else arr[idx, ...])
-            out.append(seg)
+        for lo, hi in zip(start, end):
+            if hi > lo:
+                out.append(self._from_indices(np.sort(order[lo:hi])))
         return out
 
     def split(self, dx: float = 0.5, minPerc: float = 0.05) -> List["PointCloud"]:
         """
-        Split into two parts by scanning vertical cuts along X and maximising
-        the difference of `alignWithX()` angles (original heuristic).
+        Split into two parts at the sharpest bend of the wall.
+
+        The cut is made at the vertex of the frame's polyline with the largest
+        turning angle that leaves at least `minPerc` of the points on each side.
+        A wall without a bend is cut at its median ``s``.
+
+        Parameters
+        ----------
+        dx : float
+            Unused; kept for backward compatibility.
+        minPerc : float, default 0.05
+            Minimum fraction of points on each side of the cut.
+
+        Returns
+        -------
+        list[PointCloud]
+            ``[before, after]`` along increasing ``s``.
         """
         v = self.points
         if v.size == 0:
             return []
 
-        pmin, pmax = self.boundingBox()
-        vv = v - pmin  # local frame
-        lx = float(pmax[0] - pmin[0])
-        nx = max(1, int(lx / dx) - 1)
-
-        deltaA = np.zeros(nx, dtype=float)
-        n_total = vv.shape[0]
-        n_min = int(max(1, minPerc * n_total))
-        n_max = n_total - n_min
-
-        def _angle_of(points_xyz: ArrayF) -> float:
-            tmp = PointCloud(points=points_xyz + pmin)
-            return tmp.dipDirection()
-
-        for i in range(nx):
-            x_cut = dx + i * dx
-            left_ids = np.where(vv[:, 0] <= x_cut)[0]
-            n_left = left_ids.size
-            if n_left < n_min or n_left > n_max:
-                continue
-            right_ids = np.setdiff1d(np.arange(n_total), left_ids, assume_unique=False)
-            a1 = _angle_of(vv[left_ids, :] + pmin)
-            a2 = _angle_of(vv[right_ids, :] + pmin)
-            deltaA[i] = a1 - a2
-
-        i_best = int(np.argmax(np.abs(deltaA)))
-        x_cut = dx + i_best * dx
-        left_ids = np.where(vv[:, 0] <= x_cut)[0]
-        right_ids = np.setdiff1d(np.arange(n_total), left_ids, assume_unique=False)
-
-        return [self._from_indices(left_ids), self._from_indices(right_ids)]
+        s = self.frame.xyz_to_sde(v)[:, 0]
+        s_cut = self._split_position(s, minPerc)
+        left = s <= s_cut
+        return [self._from_indices(np.flatnonzero(left)), self._from_indices(np.flatnonzero(~left))]
 
     def resolution(self) -> float:
         """
@@ -277,110 +260,206 @@ class PointCloud(Model):
 
     def slice(
         self,
-        direction: NDArray[np.float64],
-        increment: float,
-        label: str,
+        direction: Optional[NDArray[np.float64]] = None,
+        increment: Optional[float] = None,
+        label: Optional[str] = None,
         *,
+        frame: Optional[CurvilinearFrame] = None,
         slice_height_increment: float = -1.0,
         slice_resolution_factor: float = 5.0,
+        min_points: int = 1,
+        transverse_radius: Optional[float] = None,
+        outlier_fraction: float = 0.0,
+        outlier_radius: Optional[float] = None,
+        method: str = "interp",
+        refine: bool = True,
         **kwargs,
     ) -> Tuple[List["Geometry"], NDArray]:
         """
-        Vectorised point-cloud slicing:
-        - Rotate/centre so `direction` aligns with +X'
-        - Bin all points to slice centers at once (±increment/2 segments)
-        - Predict materials at segment midpoints via KNN classification
-        - Assemble Geometry objects (light per-slice loop only)
+        Slice the point cloud into 2D profiles.
+
+        By default the slices follow the strike of the wall: they are surfaces of
+        constant ``s`` of the curvilinear frame, `increment` apart, and each profile
+        is given in ``(d, e)`` (distance along the dip direction, elevation). No
+        prior alignment or segmentation of the model is needed, and slabs tile the
+        wall around bends without gaps or overlaps.
+
+        Processing outline
+        ------------------
+        1. Map the points to slicing coordinates (:meth:`Model._slicing_coords`).
+        2. Bin all points to slabs of ``+-increment/2`` around the slice centres.
+        3. Build an ordered profile, crest to toe, through each slab (see `method`).
+        4. Predict materials at segment midpoints via KNN classification.
+
+        Parameters
+        ----------
+        direction : np.ndarray, optional
+            ``None`` (default) slices along the strike. A vector cuts parallel slices
+            normal to that fixed direction instead; the profile coordinates are then
+            the two remaining axes of the points rotated so that `direction` is +X.
+        increment : float
+            Spacing between consecutive slices.
+        label : str
+            Name of the point attribute holding material IDs.
+        frame : CurvilinearFrame, optional
+            Frame to slice in. Defaults to the frame of the point cloud.
+        method : {"interp", "walk"}
+            How the profile is built from the points of a slab.
+
+            - ``"interp"`` (default): the slab is a height field over the direction
+              up the face, binned every `slice_height_increment`, with one node at
+              the median of each bin (:func:`profile_from_slab`). Not iterative,
+              and insensitive to stray points. Along the strike the direction up
+              the face is the V axis of the frame; with a fixed `direction` it is
+              the main direction of each slab.
+            - ``"walk"``: step through the points from crest to toe
+              (:func:`pcWalk`). Can follow a surface that folds back over the
+              face plane, but may stop early.
+        refine : bool
+            With ``"interp"``: second pass that evens out the node spacing along
+            the profile.
+        slice_height_increment : float
+            Node spacing of the profile. If not positive,
+            ``resolution() * slice_resolution_factor`` is used.
+        slice_resolution_factor : float
+            See `slice_height_increment`.
+        min_points : int
+            Slabs with fewer points are skipped.
+        transverse_radius : float, optional
+            Keep only the points of each slab within this distance (along the
+            profile's horizontal axis) of the slab's median.
+        outlier_fraction : float
+            Stray-point filter, applied to each slab in the profile plane. A point
+            is dropped if it has fewer neighbours within `outlier_radius` than this
+            fraction of the slab's median. Stray points off the surface (a sparse
+            second layer, isolated points above the crest) otherwise pull the walk
+            away from it. ``0`` (default) disables the filter; ``0.3`` is a
+            reasonable value to try. It changes which walks fail rather than
+            removing failures altogether, so check the result.
+        outlier_radius : float, optional
+            Radius used to count neighbours. Defaults to
+            ``1.25 * resolution()``.
 
         Returns
         -------
-        list[Geometry], ndarray
+        profiles : list[Geometry]
+            One profile per valid slice, ordered from crest to toe, with material
+            IDs per segment as attributes.
+        positions : ndarray
+            Position of each slice (``s``, or the distance along `direction`). With
+            the strike-based slicing, world coordinates of a profile are
+            ``frame.sde_to_xyz(np.column_stack([np.full(n, s_k), d, e]))``.
         """
-        points = self.points.copy()  # copy because we modify
-        if points.size == 0:
+        if self.points.size == 0:
             return [], np.array([], dtype=float)
 
-        if not self.has_attr(label):
+        if label is None or not self.has_attr(label):
             raise ValueError(f"Attribute '{label}' not found.")
         mat_ids = np.asarray(self.get_attr(label))
         if mat_ids.ndim == 2 and mat_ids.shape[1] == 1:
             mat_ids = mat_ids[:, 0]
         mat_ids = mat_ids.astype(int, copy=False)
 
-        if increment <= 0:
+        if increment is None or increment <= 0:
             raise ValueError("increment must be > 0.")
-        
-        # --- Decide vertical resolution (shared Z' grid)
+        if method not in ("interp", "walk"):
+            raise ValueError("method must be 'interp' or 'walk'.")
+
+        # --- Decide vertical resolution (shared walk step)
         dlt_z = slice_height_increment if slice_height_increment > 0 else self.resolution() * slice_resolution_factor
         if not np.isfinite(dlt_z) or dlt_z <= 0:
             raise ValueError("slice_height_increment and resolution are invalid.")
-        
-        # --- Align: rotate so direction -> +x'
-        R = rotationAlign2x(direction)               # Get rotation matrix
-        centre = points.mean(axis=0, keepdims=True)  # (1,3)
-        points = (points - centre) @ R.T             # row-vector convention
-        centre = (centre @ R.T)
-        centre_x = centre[0, 0]
-        centre = centre[0, 1:]
 
-        # --- Slice centers along x'
+        # --- Slicing coordinates: column 0 is constant on a slice
+        points, used_frame = self._slicing_coords(direction, frame)
+        # Direction up the face in the profile plane: the frame's V axis without
+        # its component along the strike (None: use each slab's main direction)
+        face_axis = None
+        if method == "interp" and used_frame is not None and used_frame.pca_axes is not None:
+            v_axis = used_frame.pca_axes[1, 1:]
+            if np.linalg.norm(v_axis) > 0.1:
+                face_axis = v_axis / np.linalg.norm(v_axis)
+        ok = np.isfinite(points).all(axis=1)
+        if not ok.all():
+            points = points[ok]
+            mat_ids = mat_ids[ok]
+        if points.shape[0] == 0:
+            return [], np.array([], dtype=float)
+
+        # --- Slice centres
         x = points[:, 0]
         x_min = float(np.min(x))
         x_max = float(np.max(x))
         if not np.isfinite(x_max - x_min) or x_max <= x_min:
             return [], np.array([], float)
 
-        half = 0.5 * increment  # typical "±inc/2" slab
+        half = 0.5 * increment  # typical "+-inc/2" slab
 
-        # Slice centres
         x_positions = np.arange(x_min + half, x_max + 1e-12, increment, dtype=float)
         num_slices = x_positions.size
         if num_slices == 0:
             return [], np.array([], float)
 
-        # ---- Sort once by x and keep views for YZ ----
+        # ---- Sort once by x and keep views for the profile plane ----
         order = np.argsort(x, kind="stable")
         xs = x[order]
-        yz = points[order, 1:]   # (N,2) view: [y,z]
+        yz = points[order, 1:]   # (N,2): profile-plane coordinates
 
         # ---- For each slab m, find contiguous [start:end) in xs ----
-        left  = x_positions - half  # min(dlt_z/2, half)
-        right = x_positions + half  # min(dlt_z/2, half)
-        starts = np.searchsorted(xs, left,  side="left")
-        ends   = np.searchsorted(xs, right, side="right")
+        starts = np.searchsorted(xs, x_positions - half, side="left")
+        ends   = np.searchsorted(xs, x_positions + half, side="right")
 
-        # Start
         valid_slices = starts < ends
         if not valid_slices.any():
             return [], np.array([], dtype=float)
+        min_points = max(int(min_points), 1)
+        if outlier_fraction > 0 and outlier_radius is None:
+            outlier_radius = 1.25 * self.resolution()
         polylines = []
         max_pts = 0
         for i in range(num_slices):
-            # --- Bin all points to their nearest slice centre (slab ±inc/2)
             lo, hi = starts[i], ends[i]
             slab_points = yz[lo:hi]
             dlt_x = np.abs(xs[lo:hi] - x_positions[i])
 
-            if slab_points.size == 0:
-                # empty slab
+            if transverse_radius is not None and slab_points.shape[0] > 0:
+                keep = np.abs(slab_points[:, 0] - np.median(slab_points[:, 0])) <= transverse_radius
+                slab_points = slab_points[keep]
+                dlt_x = dlt_x[keep]
+
+            if outlier_fraction > 0 and slab_points.shape[0] > 2:
+                # Stray points have few neighbours compared with the surface
+                count = cKDTree(slab_points).query_ball_point(slab_points, outlier_radius, return_length=True)
+                keep = count >= outlier_fraction * np.median(count)
+                slab_points = slab_points[keep]
+                dlt_x = dlt_x[keep]
+
+            if slab_points.shape[0] < min_points:
+                # empty or too sparse slab
                 valid_slices[i] = False
                 continue
 
-            # Compute PCA to order points along main direction
+            # PCA of the slab: its main direction
             X = slab_points - slab_points.mean(0)
             _, _, vh = np.linalg.svd(X, full_matrices=False)
-            pc1 = X @ vh[0]
-            order = np.argsort(pc1)
-            slab_points = slab_points[order]
-            dlt_x = dlt_x[order]
-            if slab_points[0, 1] < slab_points[-1, 1]:
-                # ensure ascending order in Y
-                slab_points = slab_points[::-1]
-                dlt_x = dlt_x[::-1]
 
-            # Walk along profile
-            nodes = pcWalk(slab_points[0], slab_points[-1], slab_points, dlt_x, dlt_z)
-            
+            if method == "interp":
+                # Height field over the direction up the face: no iteration
+                axis_i = vh[0] if face_axis is None else face_axis
+                nodes = profile_from_slab(slab_points, dlt_z, axis_i, refine=refine)
+            else:
+                # Order points along the main direction, crest first
+                pc1 = X @ vh[0]
+                order_i = np.argsort(pc1)
+                slab_points = slab_points[order_i]
+                dlt_x = dlt_x[order_i]
+                if slab_points[0, 1] < slab_points[-1, 1]:
+                    slab_points = slab_points[::-1]
+                    dlt_x = dlt_x[::-1]
+
+                # Walk along profile
+                nodes = pcWalk(slab_points[0], slab_points[-1], slab_points, dlt_x, dlt_z)
+
             # Check whether profile is valid
             if nodes.shape[0] < 2:
                 # Invalid profile: not enough points
@@ -404,8 +483,7 @@ class PointCloud(Model):
         z_grid = nodes[:, :, 1]
 
         # --- Midpoints for materials (predict in one batch too)
-        # Midpoints along vertical segments (drop last row because it has no pair)
-        x_mid = x_grid[:, :-1]          # x is constant per slice
+        x_mid = x_grid[:, :-1]          # constant per slice
         y_mid = 0.5 * (y_grid[:, :-1] + y_grid[:, 1:])
         z_mid = 0.5 * (z_grid[:, :-1] + z_grid[:, 1:])
 
@@ -413,17 +491,16 @@ class PointCloud(Model):
         mid_nan = np.isnan(y_mid) | np.isnan(z_mid)
 
         mid = np.column_stack((x_mid[~mid_nan], y_mid[~mid_nan], z_mid[~mid_nan]))
-        
-        # material classifier (3D)
-        # cls = RadiusNeighborsClassifier(radius=max(increment/2, dlt_z/2), weights="distance")
-        cls = KNeighborsClassifier(n_neighbors=10, weights="distance")
+
+        # material classifier (3D, in slicing coordinates)
+        cls = KNeighborsClassifier(n_neighbors=min(10, points.shape[0]), weights="distance")
         cls.fit(points, mat_ids)
         mats_all[~mid_nan] = cls.predict(mid)
 
         profiles = []
         for i in range(len(x_positions)):
             nodes_i = nodes[i]
-            mask = np.isfinite(nodes_i).all(axis=1)   # (N,) True if both y and z finite
+            mask = np.isfinite(nodes_i).all(axis=1)   # (N,) True if both coordinates finite
             nodes_i = nodes_i[mask]
             mats_all_i = mats_all[i]
             mats_all_i = mats_all_i[mats_all_i >= 0]
@@ -431,10 +508,10 @@ class PointCloud(Model):
                 raise ValueError("Invalid profile")
             if nodes_i.shape[0] != mats_all_i.shape[0] + 1:
                 raise ValueError("Invalid profile")
-            profiles.append(Geometry(nodes=nodes_i+centre, attributes=mats_all_i))
+            profiles.append(Geometry(nodes=nodes_i, attributes=mats_all_i))
 
-        return profiles, x_positions + centre_x
- 
+        return profiles, x_positions
+
 
     def section(
         self,
@@ -450,73 +527,40 @@ class PointCloud(Model):
         max_turn_angle: float | None = np.deg2rad(45.0),
         weight_power: float = 1.0,
         min_new_fraction: float = 0.10,
+        slice_height_increment: float = 0.5,
+        frame: Optional[CurvilinearFrame] = None,
+        method: str = "interp",
     ):
         """
         Extract 2D profiles along the strike of the model.
 
-        Unlike :meth:`slice`, which cuts parallel profiles along a single
-        fixed direction, ``section`` traces a polyline that follows the
-        curvature of the point cloud along strike, then extracts a profile
-        perpendicular to that polyline at every ``increment`` step. This
-        makes it suitable for curved or non-planar features (e.g. a bench
-        or wall that changes orientation along its length), where a
-        fixed-direction slice would cut obliquely through the surface.
-
-        Processing outline
-        -------------------
-        1. Align the point cloud so its mean strike lies along +X
-           (via :meth:`dipDirection` / :meth:`alignWithX`).
-        2. Trace a polyline of nodes along strike in the XY-plane, spaced
-           roughly ``increment`` apart, following the local point density
-           (:func:`trace_polyline_nodes`).
-        3. Assign the original points to the section (slab) centred on
-           each polyline segment midpoint, using a strip of half-width
-           ``transverse_radius`` normal to the segment tangent
-           (:func:`assign_sections_from_nodes`).
-        4. For each section, walk the assigned points in local
-           (distance-along-section, height) coordinates to build an
-           ordered profile (:func:`pcWalk`), then rotate the profile back
-           into global XYZ coordinates.
-        5. Classify materials at the profile points via KNN
-           (using the `label` attribute) and package the results as
-           :class:`Geometry` profiles plus a combined :class:`PointCloud`
-           of all section points.
+        This is :meth:`slice` along the strike (``direction=None``) with the
+        profiles also returned as a 3D point cloud in world coordinates (see
+        :meth:`Model.section`). The point cloud itself is not modified.
 
         Parameters
         ----------
         increment : float
-            Target spacing, in the point cloud's units, between
-            consecutive polyline nodes along strike (and hence between
-            sections).
+            Spacing, in the point cloud's units, between consecutive sections
+            along the strike.
         label : str
-            Name of the point attribute holding material/class IDs, used
-            to classify the extracted profile points.
+            Name of the point attribute holding material/class IDs.
         transverse_radius : float, optional
-            Half-width of the strip (normal to the local strike direction)
-            used to assign points to each section. Defaults to half the
-            point cloud's vertical (Z) extent.
-        initial_direction : tuple[float, float], optional
-            Initial (x, y) marching direction used to seed the polyline
-            trace before it locks onto the local point distribution.
+            Half-width, along the dip direction, of the strip of points used
+            for each section (centred on the section's median). ``None`` uses
+            all points of the slab.
         min_points : int, optional
-            Minimum number of points required for a section to be
-            considered valid; sections with fewer points are discarded.
-        max_nodes : int, optional
-            Maximum number of nodes to trace along the polyline. ``None``
-            for no limit.
-        max_iter : int, optional
-            Maximum number of refinement iterations per traced node.
-        tol : float, optional
-            Convergence tolerance used while tracing each node.
-        max_turn_angle : float, optional
-            Maximum allowed change in marching direction between
-            consecutive nodes, in radians. ``None`` disables the limit.
-        weight_power : float, optional
-            Power applied to distance-based weighting when estimating the
-            local marching direction/centre at each step.
-        min_new_fraction : float, optional
-            Minimum fraction of newly covered points required per step for
-            the trace to continue advancing.
+            Minimum number of points required for a section to be considered
+            valid; sections with fewer points are discarded.
+        slice_height_increment : float, optional
+            Node spacing of the profiles (see :meth:`slice`).
+        method : {"interp", "walk"}, optional
+            How each profile is built from its points (see :meth:`slice`).
+        frame : CurvilinearFrame, optional
+            Frame to slice in. Defaults to the frame of the point cloud.
+        initial_direction, max_nodes, max_iter, tol, max_turn_angle, weight_power, min_new_fraction :
+            Ignored. They controlled the polyline tracing that the curvilinear
+            frame replaces and are kept for backward compatibility.
 
         Returns
         -------
@@ -533,187 +577,217 @@ class PointCloud(Model):
         Raises
         ------
         ValueError
-            If no valid sections are found, or if a constructed profile is
-            inconsistent (mismatched node/material counts).
+            If no valid sections are found.
         """
-        self_dip_dir = self.dipDirection()
-        self_centre = self.centroid()
-        self.translate(-self_centre)
-        self.alignWithX(sense=-1)
-
-        if transverse_radius is None:
-            transverse_radius = float((self.points[:,-1].max() - self.points[:,-1].min()) / 2)
-        nodes = trace_polyline_nodes(
-            points=self.points,
-            increment=increment,
-            transverse_radius=transverse_radius,
-            initial_direction=initial_direction,
+        return super().section(
+            increment,
+            label,
+            frame=frame,
+            slice_height_increment=slice_height_increment,
             min_points=min_points,
-            max_nodes=max_nodes,
-            max_iter=max_iter,
-            tol=tol,
-            max_turn_angle=max_turn_angle,
-            weight_power=weight_power,
-            min_new_fraction=min_new_fraction,
-        )
-
-        # ------------------------------------------------------------
-        # Assign original point-cloud points to each section
-        # ------------------------------------------------------------
-        section_ids, centres, tangents, section_dirs = assign_sections_from_nodes(
-            points=self.points,
-            nodes=nodes,
             transverse_radius=transverse_radius,
-            min_points=min_points,
+            method=method,
         )
 
-        # ------------------------------------------------------------
-        # Walk each section in local 2D coordinates, then rotate back
-        # to the same global XYZ system as self.points.
-        # ------------------------------------------------------------
-        sections = []
-        valid = np.ones(len(section_ids), dtype=bool)
-        section_id = []
+    # ----------------------------
+    # Filling holes
+    # ----------------------------
+    def fillHoles(
+        self,
+        attributes: Sequence[str] | str = (),
+        *,
+        kinds: Optional[Dict[str, str]] = None,
+        spacing: Optional[float] = None,
+        cell: Optional[float] = None,
+        min_cells: int = 4,
+        use_removed: bool = True,
+        ring_scale: float = 0.5,
+        attr_ring_scale: float = 1.0,
+        max_train: int = 2000,
+        n_closest: Optional[int] = None,
+        variogram: str = "spherical",
+        attr_variogram: Optional[str] = None,
+        trend_order: int = 1,
+        nlags: int = 20,
+        aniso: float = 10.0,
+        bedding_angle: float = 0.0,
+        geometry_aniso: float = 3.0,
+        shared_variogram: bool = True,
+        others: str = "nearest",
+        seed: int = 0,
+        return_info: bool = False,
+    ):
+        """
+        Create points in the missing parts of the point cloud and krige their
+        coordinates and the selected attributes.
 
-        for k, idx in enumerate(section_ids):
-            if idx.size < min_points:
-                valid[k] = False
-                continue
+        The work is done in the ``(u, v, w)`` coordinates of the curvilinear frame
+        (see :meth:`Model.uvw`), where the wall is unrolled onto its best-fit plane:
+        ``w`` is a small residual even for a wall with corners, ``u`` runs along
+        the strike and ``v`` up-dip, so layering is anisotropic along ``u``.
 
-            # Original points belonging to this slab, in global XYZ coordinates
-            slab_points = self.points[idx]
+        Processing outline
+        ------------------
+        1. Find the missing parts on an occupancy grid in ``(u, v)``: empty cells
+           enclosed by points, plus empty cells that held points taken out with
+           :meth:`removePoints`. Each connected region is one hole.
+        2. Create new points in every hole on a regular ``(u, v)`` grid.
+        3. Height: remove a polynomial trend from ``w`` of the points in a ring
+           around the hole, fit a variogram to the residual, krige it at the new
+           points and add the trend back. Map ``(u, v, w)`` back to ``(x, y, z)``.
+        4. Attributes: integer-valued ones by indicator kriging (a probability per
+           class, corrected to lie in [0, 1] and sum to 1), the others by ordinary
+           kriging.
 
-            # Relative XY coordinates with respect to the section centre
-            rel_xy = slab_points[:, :2] - centres[k]
+        Parameters
+        ----------
+        attributes : sequence of str
+            Per-point attributes to krige at the new points.
+        kinds : dict, optional
+            ``name -> "categorical" | "continuous"`` to override the automatic
+            choice (integer-valued attributes are categorical).
+        spacing : float, optional
+            Spacing of the new points. Defaults, for each hole, to the spacing
+            that matches the density of the points around it.
+        cell : float, optional
+            Cell size of the occupancy grid. Defaults to ``5 * resolution()``.
+        min_cells : int
+            Smallest hole, in cells; smaller gaps are sampling noise.
+        use_removed : bool
+            Also fill the cells emptied by :meth:`removePoints`.
+        ring_scale, attr_ring_scale : float
+            Width of the ring of points used for the height and for the
+            attributes, as a fraction of the hole's equivalent diameter.
+        max_train : int
+            Largest number of ring points used per kriging system; the ring is
+            thinned evenly to this number.
+        n_closest : int, optional
+            ``None`` (default) solves one system per hole with all ring points.
+            A number uses only that many nearest ring points per new point.
+        variogram, attr_variogram : str
+            Variogram model for the height and for the attributes: "spherical",
+            "exponential", "gaussian" or "linear".
+        trend_order : {0, 1, 2}
+            Polynomial trend removed from ``w`` before kriging.
+        nlags : int
+            Lag bins of the experimental variograms.
+        aniso : float
+            Attribute ranges along the layers divided by the range across them
+            (1 = isotropic).
+        bedding_angle : float
+            Angle (degrees, counter-clockwise) of the layers from horizontal,
+            within the plane of the face.
+        geometry_aniso : float
+            Same ratio as `aniso` for the height ``w``: values above 1 assume the
+            shape of the face persists further along the strike (e.g. benches)
+            than up-dip.
+        shared_variogram : bool
+            Use one variogram for all classes of a categorical attribute.
+        others : {"nearest", "nan"}
+            Value given to the attributes that are not kriged: that of the nearest
+            existing point, or NaN.
+        seed : int
+            Random seed for thinning the rings.
+        return_info : bool
+            Also return a dict with the holes found and the fitted variograms.
 
-            # Local coordinates
-            #
-            # dlt_s: coordinate along the wall/segment tangent
-            # dlt_r: coordinate along the 2D section direction
-            dlt_s = rel_xy @ tangents[k]
-            dlt_r = rel_xy @ section_dirs[k]
-            z = slab_points[:, 2]
+        Returns
+        -------
+        PointCloud
+            A new point cloud with the existing points followed by the new ones.
+            Extra attributes: ``"filled"`` (1 for new points), ``"hole_id"``,
+            ``"kriging_std"`` (standard deviation of the kriged height); per
+            categorical attribute ``"<name>_P<class>"`` and ``"<name>_Pmax"``; per
+            continuous attribute ``"<name>_std"``.
+        dict
+            Only with `return_info`.
+        """
+        if isinstance(attributes, str):
+            attributes = [attributes]
+        attributes = list(attributes)
+        kinds = {} if kinds is None else dict(kinds)
+        if others not in ("nearest", "nan"):
+            raise ValueError("others must be 'nearest' or 'nan'.")
+        n = self.points.shape[0]
+        if n < 3:
+            raise ValueError("fillHoles() needs >=3 points.")
 
-            # Local 2D profile coordinates used by pcWalk:
-            # column 0 = distance along section direction
-            # column 1 = height
-            profile_points = np.column_stack([dlt_r, z])
+        # ---- (u, v, w) of the existing points
+        frame = self.frame
+        uvw = self.uvw()
+        ok = np.isfinite(uvw).all(axis=1)
+        idx_ok = np.flatnonzero(ok)
 
-            # --------------------------------------------------------
-            # Order points before pcWalk
-            # --------------------------------------------------------
-            X = profile_points - profile_points.mean(axis=0)
-            _, _, vh = np.linalg.svd(X, full_matrices=False)
-
-            pc1 = X @ vh[0]
-            order = np.argsort(pc1)
-
-            profile_points = profile_points[order]
-            dlt_s = dlt_s[order]
-            dlt_r = dlt_r[order]
-
-            # Keep your existing orientation convention
-            if profile_points[0, 1] < profile_points[-1, 1]:
-                profile_points = profile_points[::-1]
-                dlt_s = dlt_s[::-1]
-                dlt_r = dlt_r[::-1]
-
-            # --------------------------------------------------------
-            # Walk along profile in local 2D coordinates
-            # section[:, 0] = local dlt_r
-            # section[:, 1] = z
-            # --------------------------------------------------------
-            section = pcWalk(
-                profile_points[0],
-                profile_points[-1],
-                profile_points,
-                dlt_s,
-                0.5,
-            )
-
-            # --------------------------------------------------------
-            # Rotate section back to global XYZ coordinates.
-            #
-            # The extracted profile lies exactly on the section plane,
-            # so its coordinate along the tangent is zero.
-            #
-            # global_xy = centre + r * section_direction
-            # --------------------------------------------------------
-            r_sec = section[:, 0]
-            z_sec = section[:, 1]
-
-            xy_sec = (
-                centres[k][None, :]
-                + r_sec[:, None] * section_dirs[k][None, :]
-            )
-
-            section_global = np.column_stack([xy_sec, z_sec])
-            sections.append(section_global)
-            section_id.append([k] * section_global.shape[0])
-
-        # ------------------------------------------------------------
-        # Pack variable-length global 3D sections into padded array
-        # ------------------------------------------------------------
-        if len(sections) == 0:
-            raise ValueError("No valid sections found. Try adjusting parameters.")
-        
-        section_pts = np.concatenate(sections, axis=0)
-        section_id = np.concatenate(section_id, axis=0).astype(int)
-
-        # ------------------------------------------------------------
-        # Material classifier in global XYZ coordinates
-        # ------------------------------------------------------------
-        mat_ids = self.get_attr(label)
-        cls = KNeighborsClassifier(
-            n_neighbors=10,
-            weights="distance",
-        )
-        cls.fit(self.points, mat_ids)
-        material_id = cls.predict(section_pts)
-
-        # ------------------------------------------------------------
-        # Construct PointCloud sections with material attributes
-        # ------------------------------------------------------------
-        sections_pc = PointCloud(points=section_pts)
-        sections_pc.set_attr(label, material_id)
-        sections_pc.set_attr("Profile", section_id)
-        sections_pc.rotate(-self_dip_dir)  # rotate back to original orientation
-        sections_pc.translate(self_centre)  # translate back to original position
-
-        self.rotate(-self_dip_dir)  # rotate back to original orientation
-        self.translate(self_centre)  # translate back to original position
-
-        # ------------------------------------------------------------
-        # Create Geometry 2D profiles
-        # ------------------------------------------------------------
-        profiles = []
-
-        for id in np.unique(section_id):
-            nodes_i = section_pts[section_id == id]
-            mats_i = material_id[section_id == id]
-
-            if nodes_i.shape[0] < 2 or mats_i.shape[0] < 2:
-                raise ValueError("Invalid profile")
-
-            if nodes_i.shape[0] != mats_i.shape[0] :
-                raise ValueError("Invalid profile")
-            
-            z_min = nodes_i[:, 2].min()
-            id_z_max = np.argmax(nodes_i[:, 2])
-            nodes_i[:, :2] = nodes_i[:, :2] - nodes_i[id_z_max, :2]  # relative to base of section
-            nodes_i[:, 2] = nodes_i[:, 2] - z_min  # relative to base of section
-            dist_xy = np.linalg.norm(nodes_i[:, :2], axis=1)
-            prof_coords = np.column_stack([dist_xy, nodes_i[:, 2]])
-
-            profiles.append(
-                Geometry(
-                    nodes=prof_coords,
-                    attributes=mats_i[:-1],
+        spec = {}
+        for name in attributes:
+            if not self.has_attr(name):
+                raise ValueError(f"Attribute '{name}' not found.")
+            arr = np.asarray(self.get_attr(name))
+            if arr.ndim == 2 and arr.shape[1] == 1:
+                arr = arr[:, 0]
+            kind = kinds.get(name)
+            if kind is None:
+                integer_like = arr.ndim == 1 and (
+                    np.issubdtype(arr.dtype, np.integer) or np.issubdtype(arr.dtype, np.bool_)
+                    or (np.issubdtype(arr.dtype, np.floating) and np.all(np.mod(arr[ok], 1) == 0))
                 )
-            )
-        return profiles, sections_pc
+                kind = "categorical" if integer_like else "continuous"
+            spec[name] = (arr[ok], kind)
 
+        if cell is None:
+            cell = 5.0 * self.resolution()
+        removed_uv = None
+        if use_removed and self._removed is not None and self._removed.shape[0] > 0:
+            removed_uv = frame.xyz_to_uvw(self._removed)[:, :2]
 
+        res = fill_holes_uv(
+            uvw[ok], spec,
+            cell=cell, removed_uv=removed_uv, spacing=spacing, min_cells=min_cells,
+            ring_scale=ring_scale, attr_ring_scale=attr_ring_scale, max_train=max_train,
+            n_closest=n_closest, variogram=variogram, attr_variogram=attr_variogram,
+            trend_order=trend_order, nlags=nlags, aniso=aniso,
+            angle=frame.horizontal_angle_uv() + bedding_angle, w_aniso=geometry_aniso,
+            shared_variogram=shared_variogram, seed=seed,
+        )
+        m = res["uvw"].shape[0]
+
+        # ---- assemble: existing points followed by the new ones
+        xyz_new = frame.uvw_to_xyz(res["uvw"]) if m else np.empty((0, 3))
+        out = PointCloud(points=np.vstack([self.points, xyz_new]))
+        out.set_attr("filled", np.r_[np.zeros(n, dtype=np.int8), np.ones(m, dtype=np.int8)])
+        out.set_attr("hole_id", np.r_[np.zeros(n, dtype=np.int32), res["hole"].astype(np.int32)])
+        out.set_attr("kriging_std", np.r_[np.zeros(n), res["std"]].astype(np.float32))
+
+        nearest = idx_ok[res["nearest"]] if m else np.empty(0, dtype=np.int64)
+        for name, arr in self.attrs.items():
+            if name in spec or name in ("filled", "hole_id", "kriging_std"):
+                continue
+            if others == "nearest":
+                out.set_attr(name, np.concatenate([arr, arr[nearest]], axis=0))
+            else:
+                pad = np.full((m,) + arr.shape[1:], np.nan)
+                out.set_attr(name, np.concatenate([arr.astype(float), pad], axis=0))
+
+        for name in attributes:
+            r = res["attrs"][name]
+            arr = np.asarray(self.get_attr(name))
+            if arr.ndim == 2 and arr.shape[1] == 1:
+                arr = arr[:, 0]
+            if r["kind"] == "categorical":
+                out.set_attr(name, np.concatenate([arr, r["value"].astype(arr.dtype)]))
+                P_all = np.vstack([(arr[:, None] == r["classes"][None, :]).astype(float), r["probs"]])
+                for j, c in enumerate(r["classes"]):
+                    out.set_attr(f"{name}_P{_class_label(c)}", P_all[:, j].astype(np.float32))
+                out.set_attr(f"{name}_Pmax", P_all.max(axis=1).astype(np.float32))
+            else:
+                out.set_attr(name, np.concatenate([arr.astype(float), r["value"]], axis=0))
+                out.set_attr(f"{name}_std", np.r_[np.zeros(n), r["std"]].astype(np.float32))
+
+        out._frame = frame
+        if return_info:
+            info = dict(holes=res["holes"], n_new=int(m), spacing=res["spacing"], cell=res["cell"])
+            return out, info
+        return out
 
     # ----------------------------
     # Protected
@@ -725,4 +799,6 @@ class PointCloud(Model):
         sub_attrs: dict[str, np.ndarray] = {}
         for k, arr in self.attrs.items():
             sub_attrs[k] = arr[ids] if arr.ndim == 1 else arr[ids, ...]
-        return PointCloud(points=sub_pts, attrs=sub_attrs)
+        sub = PointCloud(points=sub_pts, attrs=sub_attrs)
+        sub._frame = self._frame  # a subset lives in the same space
+        return sub
