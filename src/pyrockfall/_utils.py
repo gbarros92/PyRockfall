@@ -1061,6 +1061,11 @@ def pcWalk(p_init, p_end, slab_points, dlt_x, dlt_z):
             dlt_seg = np.max(dist[within_reach])
         else:
             dlt_seg = dlt_z
+        if dlt_seg <= 1e-12 * dlt_z:
+            # Only the current position itself is within reach (an isolated
+            # point, e.g. a stray start point): take the nominal step rather
+            # than standing still.
+            dlt_seg = dlt_z
 
         cur += dir * dlt_seg * alpha
 
@@ -1070,6 +1075,131 @@ def pcWalk(p_init, p_end, slab_points, dlt_x, dlt_z):
         nodes += [np.array(cur, copy=True)]
         break_next = False
     return np.array(nodes, dtype=float)
+
+
+def _binned_median(key: np.ndarray, step: float, cols, min_count: int = 1, min_fraction: float = 0.0):
+    """Median of each array in `cols` over bins of width `step` on `key`.
+    Returns one array per column, ordered by increasing `key`. Empty bins are
+    skipped, and so are bins with fewer values than `min_count` or than
+    `min_fraction` times the median count of the occupied bins."""
+    k = np.floor((key - key.min()) / step).astype(np.int64)
+    out = []
+    for c in cols:
+        o = np.lexsort((c, k))
+        ks = k[o]
+        starts = np.r_[0, 1 + np.flatnonzero(np.diff(ks))]
+        cnt = np.diff(np.r_[starts, ks.size])
+        med = c[o][starts + cnt // 2]
+        out.append(med[cnt >= max(min_count, min_fraction * np.median(cnt))])
+    return out
+
+
+def _arclength_on_polyline(points: np.ndarray, V: np.ndarray) -> np.ndarray:
+    """Arclength, along polyline `V`, of the projection of each point onto it.
+    The first and last segments are extended, so points beyond the ends get an
+    arclength below zero or above the length of `V`."""
+    ab = np.diff(V, axis=0)
+    L = np.maximum(np.hypot(ab[:, 0], ab[:, 1]), 1e-12)
+    S0 = np.r_[0.0, np.cumsum(L)]
+    best = np.full(points.shape[0], np.inf)
+    arc = np.zeros(points.shape[0])
+    K = ab.shape[0]
+    for i in range(K):
+        q = points - V[i]
+        t = np.clip(q @ ab[i] / L[i] ** 2, -np.inf if i == 0 else 0.0, np.inf if i == K - 1 else 1.0)
+        r = q - t[:, None] * ab[i]
+        d = np.hypot(r[:, 0], r[:, 1])
+        m = d < best
+        best[m] = d[m]
+        arc[m] = S0[i] + t[m] * L[i]
+    return arc
+
+
+def profile_from_slab(
+    points: np.ndarray,
+    step: float,
+    axis: np.ndarray,
+    *,
+    refine: bool = True,
+    min_count: int = 1,
+    min_fraction: float = 0.1,
+) -> np.ndarray:
+    """
+    Profile through a slab of points, by interpolation instead of a walk.
+
+    The slab is treated as a height field over a straight axis lying in the
+    profile plane (for a wall: the direction up its face). Points are binned
+    along that axis and each bin gives one node at the median offset from the
+    axis, so a sparse layer of stray points does not move the profile and there
+    is nothing to converge.
+
+    Parameters
+    ----------
+    points : (N, 2) array
+        Slab points in the profile plane, e.g. (d, e).
+    step : float
+        Node spacing.
+    axis : (2,) array
+        Direction, in the profile plane, along which the surface is single-valued.
+    refine : bool
+        Second pass: re-bin the points along the arclength of the first profile
+        and take the median position per bin. This evens out the node spacing
+        where the surface is steep relative to `axis` (floor, bench edges).
+    min_count : int
+        Bins with fewer points give no node.
+    min_fraction : float
+        Bins with fewer points than this fraction of the median bin give no node
+        either. This drops bins that hold only a few isolated stray points, e.g.
+        above the crest.
+
+    Returns
+    -------
+    (M, 2) array
+        Profile nodes ordered from the highest to the lowest second coordinate
+        (crest to toe). Fewer than two rows if the slab is too sparse.
+
+    Notes
+    -----
+    A surface that folds back over `axis` (an overhang relative to it) cannot be
+    represented; :func:`pcWalk` remains available for that case.
+    """
+    P = np.asarray(points, dtype=float)
+    if step <= 0:
+        raise ValueError("step must be > 0.")
+    if P.ndim != 2 or P.shape[1] != 2 or P.shape[0] == 0:
+        return np.empty((0, 2), dtype=float)
+    a = unit(np.asarray(axis, dtype=float).ravel()[:2])
+    normal = np.array([-a[1], a[0]])
+    t = P @ a
+    n = P @ normal
+
+    # Pass 1: height above the axis against position along it
+    key = t
+    tc, nc = _binned_median(t, 2.0 * step if refine else step, (t, n), min_count, min_fraction)
+    nodes = np.outer(tc, a) + np.outer(nc, normal)
+
+    # Pass 2: same again along the profile itself
+    if refine and nodes.shape[0] >= 2:
+        key = _arclength_on_polyline(P, nodes)
+        x, y = _binned_median(key, step, (P[:, 0], P[:, 1]), min_count, min_fraction)
+        nodes = np.column_stack([x, y])
+
+    # End nodes: a bin median sits about half a bin inside the ends of the slab.
+    # Add the median of the outermost points at each end (a few of them, so that
+    # an isolated stray point does not become the crest or the toe).
+    if nodes.shape[0] >= 2:
+        k = min(P.shape[0], max(3, P.shape[0] // 100))
+        part = np.argpartition(key, [k - 1, P.shape[0] - k])
+        first = np.median(P[part[:k]], axis=0)
+        last = np.median(P[part[P.shape[0] - k:]], axis=0)
+        if np.linalg.norm(first - nodes[0]) > 0.1 * step and (first - nodes[0]) @ (nodes[1] - nodes[0]) < 0:
+            nodes = np.vstack([first, nodes])
+        if np.linalg.norm(last - nodes[-1]) > 0.1 * step and (last - nodes[-1]) @ (nodes[-2] - nodes[-1]) < 0:
+            nodes = np.vstack([nodes, last])
+
+    if nodes.shape[0] >= 2 and nodes[0, 1] < nodes[-1, 1]:
+        nodes = nodes[::-1]
+    return np.ascontiguousarray(nodes)
 
 
 def unit(v: np.ndarray, fallback: np.ndarray | None = None, eps: float = 1e-12) -> np.ndarray:
