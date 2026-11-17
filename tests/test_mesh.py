@@ -548,13 +548,41 @@ def test_remove_points_on_mesh_and_fill_holes_not_available():
         m.fillHoles()
 
 
-def test_slice_through_mesh_vertices_fails_cleanly():
+def test_slice_through_mesh_vertices_gives_complete_profiles():
     # Slices at x = 2, 6, ... pass exactly through the vertices of this regular mesh
     pts, tris, e = wall_mesh()
     m = pr.Mesh(points=pts, triangles=tris)
     m.set_attr("mat", (e > 6.0).astype(int))
-    with pytest.raises(ValueError, match="mesh vertices"):
-        m.slice(np.array([1.0, 0.0, 0.0]), increment=4.0, label="mat")
+    profiles, xs = m.slice(np.array([1.0, 0.0, 0.0]), increment=4.0, label="mat")
+    np.testing.assert_allclose(xs, np.arange(2.0, 40.0, 4.0))
+    for prof in profiles:
+        assert np.ptp(prof.nodes[:, 1]) == pytest.approx(12.0)
+        assert len(prof.attributes) == prof.nodes.shape[0] - 1
+
+
+def test_slice_follows_a_cut_that_turns_back():
+    # A wall with an overhang: in the slice plane the cut goes out, back in, and out
+    # again, so it is not monotonic in the horizontal coordinate.
+    yz = np.array([[0.0, 6.0], [2.0, 4.0], [1.0, 2.5], [3.0, 1.0], [5.0, 0.0]])
+    n = yz.shape[0]
+    pts = np.vstack([np.column_stack([np.full(n, x), yz]) for x in (0.0, 1.0, 2.0)])
+    tris = []
+    for r in range(2):
+        for j in range(n - 1):
+            a, b, c, d = r * n + j, (r + 1) * n + j, r * n + j + 1, (r + 1) * n + j + 1
+            tris += [[a, b, d], [a, d, c]]
+    m = pr.Mesh(points=pts, triangles=np.array(tris))
+    m.set_attr("mat", np.zeros(len(tris), dtype=int))
+    profiles, xs = m.slice(np.array([1.0, 0.0, 0.0]), increment=0.7, label="mat")
+    assert len(profiles) == 3
+    for prof in profiles:
+        # the whole polyline, in order, including the part that runs backwards
+        ends = prof.nodes[[0, -1]]
+        ends = ends[np.argsort(ends[:, 0])]
+        np.testing.assert_allclose(ends, [[0.0, 6.0], [5.0, 0.0]], atol=1e-9)
+        length = np.linalg.norm(np.diff(prof.nodes, axis=0), axis=1).sum()
+        assert length == pytest.approx(np.linalg.norm(np.diff(yz, axis=0), axis=1).sum(), abs=1e-9)
+        assert np.any(np.diff(prof.nodes[:, 0]) > 0) and np.any(np.diff(prof.nodes[:, 0]) < 0)
 
 
 # ---------------------------------------------------------------------------
