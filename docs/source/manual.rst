@@ -22,6 +22,8 @@ Core package
    :caption: Core modules
 
    _model
+   _frame
+   _kriging
    _geometry
    _geometry3d
    _pointcloud
