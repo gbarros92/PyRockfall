@@ -45,6 +45,7 @@ from pyrockfall._functionalities import (
     grid2mesh,
     mesh2PointCloud,
     pointCloud2Mesh,
+    sampleRealisations,
     slopeBelow,
     materialLayers,
     interpPercentiles,
@@ -313,6 +314,162 @@ def test_mesh_to_point_cloud_to_mesh_roundtrip_preserves_points():
     m2 = pointCloud2Mesh(mesh2PointCloud(m))
 
     np.testing.assert_array_equal(m2.points, m.points)
+
+
+def _corner_wall_points(n=4000, seed=0, leg=30.0, height=12.0):
+    """Wall dipping 60 degrees that turns 90 degrees half-way along."""
+    rng = np.random.default_rng(seed)
+    truth = pr.CurvilinearFrame([[0.0, 0.0], [leg, 0.0], [leg, leg]])
+    s = rng.uniform(0.0, 2 * leg, n)
+    e = rng.uniform(0.0, height, n)
+    d = -(e - 0.5 * height) / np.tan(np.radians(60.0))
+    return truth.sde_to_xyz(np.column_stack([s, d, e])), e
+
+
+def _triangle_edges(m):
+    tri = m.points[m.triangles]
+    return np.linalg.norm(tri - np.roll(tri, -1, axis=1), axis=2)
+
+
+def test_point_cloud2_mesh_uv_follows_a_corner():
+    pts, e = _corner_wall_points()
+    pc = pr.PointCloud(points=pts, attrs={"mat": (e > 6.0).astype(int)})
+    m = pointCloud2Mesh(pc)
+
+    np.testing.assert_array_equal(m.points, pts)
+    np.testing.assert_array_equal(m.get_attr("mat"), (e > 6.0).astype(int))
+    assert m._frame is pc._frame                                # shares the frame
+    assert np.unique(m.triangles).size == pts.shape[0]          # every point is used
+    # triangles stay on the wall: none cuts across the inside of the corner
+    assert np.percentile(_triangle_edges(m).max(axis=1), 99) < 3.0
+    # one rotation cannot flatten a wall with a corner: it leaves long triangles
+    plane = pointCloud2Mesh(pc, method="plane")
+    assert np.percentile(_triangle_edges(plane).max(axis=1), 99) > np.percentile(_triangle_edges(m).max(axis=1), 99)
+
+    # the mesh can be sectioned along the strike straight away
+    profiles, sections_pc = m.section(increment=2.3, label="mat")
+    assert len(profiles) > 20
+    heights = np.array([np.ptp(p.nodes[:, 1]) for p in profiles])
+    assert np.median(heights) > 11.0
+
+
+def test_point_cloud2_mesh_max_edge_and_invalid_method():
+    pts, e = _corner_wall_points()
+    gap = (np.abs(pts[:, 0] - 12.0) < 3.0) & (pts[:, 1] < 6.0)   # 6 m wide strip removed from one leg
+    pc = pr.PointCloud(points=pts[~gap])
+    full = pointCloud2Mesh(pc)
+    cut = pointCloud2Mesh(pc, max_edge=3.0)
+    assert cut.triangles.shape[0] < full.triangles.shape[0]
+    assert _triangle_edges(full).max() > 5.0                     # the gap is bridged
+    assert _triangle_edges(cut).max() <= 3.0                     # ... unless long triangles are dropped
+    np.testing.assert_array_equal(cut.points, pc.points)         # nodes are kept either way
+    with pytest.raises(ValueError, match="method must be"):
+        pointCloud2Mesh(pc, method="xy")
+
+
+def _filled_wall(seed=0):
+    """Corner wall with two layers and a patch removed and refilled by kriging."""
+    pts, e = _corner_wall_points(n=12000, seed=seed)
+    rng = np.random.default_rng(seed)
+    truth = pr.CurvilinearFrame([[0.0, 0.0], [30.0, 0.0], [30.0, 30.0]])
+    sde = truth.xyz_to_sde(pts)
+    # smooth undulations of the face (spatially correlated) plus a little noise
+    sde[:, 1] += 0.4 * np.sin(sde[:, 0] / 2.0) * np.cos(sde[:, 2] / 1.5) + 0.01 * rng.standard_normal(len(sde))
+    pts = truth.sde_to_xyz(sde)
+    patch = np.hypot(sde[:, 0] - 15.0, sde[:, 2] - 6.0) < 3.0
+    pc = pr.PointCloud(points=pts, attrs={"mat": np.where(patch, 9, (e > 6.0).astype(int))})
+    pc.removePoints("mat", 9)
+    return pc.fillHoles(attributes=["mat"], return_info=True)
+
+
+def test_sample_realisations_coordinates_follow_std_and_materials_follow_probabilities():
+    filled, info = _filled_wall()
+    new = filled.get_attr("filled") == 1
+    sigma = filled.get_attr("kriging_std")
+    P = np.column_stack([filled.get_attr("mat_P0"), filled.get_attr("mat_P1")])
+    assert sigma[new].min() > 0 and (P[new].max(axis=1) < 1).any()
+
+    n = 400
+    reals = sampleRealisations(filled, n, "mat", correlated=False, seed=1)
+    assert len(reals) == n
+    frame = filled.frame
+    w0 = frame.xyz_to_uvw(filled.points)
+
+    W = np.stack([frame.xyz_to_uvw(r.points)[:, 2] for r in reals])          # (n, N)
+    K = np.stack([r.get_attr("mat") for r in reals])
+    DW = np.stack([r.get_attr("dw") for r in reals])
+
+    # certain points never change
+    for r in reals[:5]:
+        np.testing.assert_array_equal(r.points[~new], filled.points[~new])
+        np.testing.assert_array_equal(r.get_attr("mat")[~new], filled.get_attr("mat")[~new])
+    # points move only along w, by the recorded displacement
+    uv_moved = np.stack([frame.xyz_to_uvw(r.points[new])[:, :2] for r in reals[:5]])
+    np.testing.assert_allclose(uv_moved, np.broadcast_to(w0[new, :2], uv_moved.shape), atol=1e-6)
+    np.testing.assert_allclose(W[:, new] - w0[new, 2], DW[:, new], atol=1e-6)
+
+    # coordinates: per point, mean w and std of w match the kriged w and kriging_std
+    dw = W[:, new] - w0[new, 2]
+    assert np.abs(np.median(dw.mean(axis=0) / sigma[new])) < 0.05
+    ratio = dw.std(axis=0) / sigma[new]
+    assert np.median(ratio) == pytest.approx(1.0, abs=0.05)
+    # materials: per point, the frequency of each class matches its probability
+    freq = np.column_stack([(K[:, new] == 0).mean(axis=0), (K[:, new] == 1).mean(axis=0)])
+    assert np.abs(freq - P[new]).mean() < 0.02
+    assert np.abs(freq - P[new]).max() < 0.15
+
+
+def test_sample_realisations_correlated_fields_keep_the_per_point_distributions():
+    filled, info = _filled_wall()
+    new = filled.get_attr("filled") == 1
+    sigma = filled.get_attr("kriging_std")[new]
+    P1 = filled.get_attr("mat_P1")[new]
+    frame = filled.frame
+    w0 = frame.xyz_to_uvw(filled.points[new])
+    from scipy.spatial import cKDTree
+    _, nn = cKDTree(w0[:, :2]).query(w0[:, :2], k=2)
+    nn = nn[:, 1]
+
+    stats = {}
+    for name, kw in (("independent", dict(correlated=False)),
+                     ("fitted", dict()),
+                     ("from fillHoles", dict(info=info))):
+        reals = sampleRealisations(filled, 300, "mat", uncertain_only=True, seed=2, **kw)
+        assert reals[0].points.shape[0] == new.sum()
+        DW = np.stack([r.get_attr("dw") for r in reals])
+        K = np.stack([r.get_attr("mat") for r in reals])
+        z = DW / sigma
+        stats[name] = dict(
+            std_ratio=np.median(DW.std(axis=0) / sigma),
+            freq_err=np.abs((K == 1).mean(axis=0) - P1).mean(),
+            rough=np.abs(z - z[:, nn]).mean(),                       # neighbour difference of z
+            flips=(K != K[:, nn]).mean(),
+        )
+    for name, st in stats.items():
+        # same per-point distributions in all modes (a correlated field over a small
+        # hole has fewer independent values, so the tolerance is wider)
+        assert st["std_ratio"] == pytest.approx(1.0, abs=0.15), name
+        assert st["freq_err"] < 0.06, name
+    for name in ("fitted", "from fillHoles"):
+        # but neighbours are alike: smooth surfaces and coherent layers
+        assert stats[name]["rough"] < 0.5 * stats["independent"]["rough"], name
+        assert stats[name]["flips"] < 0.5 * stats["independent"]["flips"], name
+
+
+def test_sample_realisations_validates_input():
+    filled, _ = _filled_wall()
+    with pytest.raises(ValueError, match="n_realisations"):
+        sampleRealisations(filled, 0, "mat")
+    with pytest.raises(ValueError, match="not found"):
+        sampleRealisations(filled, 2, "mat", std="missing")
+    plain = pr.PointCloud(points=filled.points, attrs={"mat": filled.get_attr("mat"),
+                                                      "kriging_std": filled.get_attr("kriging_std")})
+    with pytest.raises(ValueError, match="No probability attributes"):
+        sampleRealisations(plain, 2, "mat")
+    bad = pr.PointCloud(points=filled.points, attrs=dict(filled.attrs))
+    bad.set_attr("mat_P0", bad.get_attr("mat_P0") * 0.5)
+    with pytest.raises(ValueError, match="sum to 1"):
+        sampleRealisations(bad, 2, "mat")
 
 
 # ---------------------------------------------------------------------------
