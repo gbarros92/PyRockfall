@@ -299,36 +299,305 @@ def mesh2PointCloud(mesh: Mesh) -> PointCloud:
     node_attrs = {k: v for k, v in mesh.attrs.items() if v.shape[0] == n}
     return PointCloud(mesh.points.copy(), attrs=node_attrs)
 
-def pointCloud2Mesh(pc: PointCloud) -> Mesh:
+def pointCloud2Mesh(
+    pc: PointCloud,
+    *,
+    method: Literal["uv", "plane"] = "uv",
+    max_edge: Optional[float] = None,
+) -> Mesh:
     """Build a :class:`Mesh` from a point cloud via automatic Delaunay
     triangulation.
 
-    A working copy of the point cloud is levelled using its own orientation
-    utilities: :meth:`PointCloud.alignWithX` rotates it so the fitted
-    plane's strike aligns with X, then rotating by :meth:`PointCloud.dip`
-    around the X axis flattens the plane into the XY plane (leaving only
-    small residual variation on Z, i.e. local relief). A 2D Delaunay
-    triangulation is run on the levelled (X, Y) coordinates. The resulting
-    triangle connectivity is then attached to the original (untouched)
-    points. All per-point attributes are carried over onto the mesh as
-    per-node attributes.
+    By default the points are triangulated in the ``(u, v)`` plane of the
+    point cloud's curvilinear frame (see :meth:`Model.uvw`), where the wall is
+    unrolled flat along its strike. This also works for walls that change
+    direction (corners, curved walls), which no single plane can represent.
+    The triangle connectivity is attached to the original (untouched) points,
+    and all per-point attributes are carried over as per-node attributes. The
+    mesh shares the frame of the point cloud.
 
     Parameters
     ----------
     pc : PointCloud
         The source point cloud.
+    method : {"uv", "plane"}
+        ``"uv"`` (default) triangulates in the unrolled ``(u, v)`` plane.
+        ``"plane"`` levels a copy of the cloud with one rotation (strike onto
+        X, then the dip about X) and triangulates its (X, Y); only suitable
+        for a wall that is close to a single plane.
+    max_edge : float, optional
+        Drop triangles with an edge longer than this (measured in 3D). A
+        Delaunay triangulation fills the convex outline of the points, so long
+        triangles bridge gaps and concave parts of the outline. ``None`` keeps
+        every triangle.
 
     Returns
     -------
     Mesh
         A new mesh with the point cloud's nodes, automatically triangulated
-        connectivity, and per-node attributes.
+        connectivity, and per-node attributes. Points outside the frame (NaN
+        coordinates) are kept as nodes but belong to no triangle.
     """
-    levelled = PointCloud(pc.points.copy())
-    levelled.alignWithX()
-    levelled.rotate(-levelled.dip(), axis="x")
-    tri = Delaunay(levelled.points[:, :2])  # (X, Y) plane
-    return Mesh(pc.points.copy(), tri.simplices.astype(np.int32), attrs=dict(pc.attrs))
+    points = pc.points
+    if method == "uv":
+        frame = pc.frame
+        uvw = pc.uvw()
+        ok = np.isfinite(uvw).all(axis=1)
+        if ok.all():
+            simplices = Delaunay(uvw[:, :2]).simplices
+        else:
+            simplices = np.flatnonzero(ok)[Delaunay(uvw[ok, :2]).simplices]
+    elif method == "plane":
+        frame = None
+        levelled = PointCloud(points.copy())
+        levelled.alignWithX()
+        levelled.rotate(-levelled.dip(), axis="x")
+        simplices = Delaunay(levelled.points[:, :2]).simplices  # (X, Y) plane
+    else:
+        raise ValueError("method must be 'uv' or 'plane'.")
+
+    simplices = simplices.astype(np.int32)
+    if max_edge is not None:
+        tri_pts = points[simplices]                                   # (E, 3, 3)
+        edges = np.linalg.norm(tri_pts - np.roll(tri_pts, -1, axis=1), axis=2)
+        simplices = simplices[edges.max(axis=1) <= max_edge]
+
+    mesh = Mesh(points.copy(), simplices, attrs=dict(pc.attrs))
+    if frame is not None:
+        mesh.frame = frame  # same points, same space
+    return mesh
+
+def _probability_attributes(pc: PointCloud, label: str) -> Tuple[List[str], NDArray[np.float64]]:
+    """Names of the ``<label>_P<class>`` attributes of a point cloud, and their classes."""
+    prefix = f"{label}_P"
+    names, classes = [], []
+    for name in pc.list_attrs():
+        if not name.startswith(prefix) or name == f"{label}_Pmax":
+            continue
+        code = name[len(prefix):]
+        try:
+            classes.append(float(code.replace("m", "-").replace("_", ".")))
+        except ValueError:
+            continue
+        names.append(name)
+    order = np.argsort(classes)
+    return [names[i] for i in order], np.asarray(classes, dtype=float)[order]
+
+
+def sampleRealisations(
+    pc: PointCloud,
+    n_realisations: int,
+    label: str,
+    *,
+    std: str = "kriging_std",
+    correlated: bool = True,
+    info: Optional[Dict[str, Any]] = None,
+    frame=None,
+    variogram: str = "spherical",
+    geometry_aniso: float = 3.0,
+    aniso: float = 10.0,
+    bedding_angle: float = 0.0,
+    ring_scale: float = 1.0,
+    max_train: int = 2000,
+    uncertain_only: bool = False,
+    seed: int = 0,
+) -> List[PointCloud]:
+    """
+    Draw realisations of a point cloud whose position and material are uncertain,
+    e.g. the output of :meth:`PointCloud.fillHoles`.
+
+    Each point carries the standard deviation of its height above the face plane
+    (attribute `std`) and one probability per material (attributes
+    ``<label>_P<class>``, summing to 1). In every realisation:
+
+    - **Coordinates:** the height above the face plane is drawn as
+      ``w_r = w + std * z`` with ``z ~ N(0, 1)``, and the point moves by
+      ``w_r - w`` along the ``w`` axis of the curvilinear frame, keeping its
+      ``(u, v)``.
+    - **Material:** ``q ~ U[0, 1)`` is drawn and the point gets the first class
+      whose cumulative probability exceeds ``q`` (inverse CDF), so class ``k``
+      is drawn with probability ``P_k``.
+
+    Points with ``std == 0`` and a probability of 1 for one class are certain and
+    are copied unchanged.
+
+    With `correlated` (default), ``z`` and ``q = Phi(g)`` come from spatially
+    correlated Gaussian fields instead of independent draws, so each realisation
+    is a smooth surface with coherent layers ("probability-field simulation").
+    The per-point distributions are the same either way: over many realisations
+    each point's ``w`` has mean ``w`` and standard deviation `std`, and class
+    ``k`` appears with frequency ``P_k``. Only neighbouring points become alike.
+
+    The correlation is set per hole (attribute ``"hole_id"``; one group if it is
+    missing):
+
+    - from `info`, the dict returned by ``fillHoles(..., return_info=True)``,
+      which holds the variograms used to fill each hole; or
+    - otherwise fitted on the certain points around the hole, as
+      :meth:`PointCloud.fillHoles` does: the variogram of the detrended ``w``, and
+      the indicator variogram of the class whose proportion is closest to 0.5,
+      with ranges `aniso` times longer along the layers.
+
+    Parameters
+    ----------
+    pc : PointCloud
+        Point cloud with the attributes `std`, ``<label>_P<class>`` and `label`.
+    n_realisations : int
+        Number of realisations.
+    label : str
+        Material attribute. Its probabilities are ``<label>_P<class>``.
+    std : str
+        Attribute with the standard deviation of the height above the face plane.
+    correlated : bool
+        Spatially correlated draws (default) or independent draws per point.
+    info : dict, optional
+        Output of ``fillHoles(..., return_info=True)``, to reuse its variograms.
+    frame : CurvilinearFrame, optional
+        Frame in which ``w`` is measured. Defaults to the frame of `pc` (the one
+        used to fill the holes, if `pc` came straight from :meth:`fillHoles`).
+    variogram : str
+        Variogram model fitted when `info` is not given.
+    geometry_aniso, aniso, bedding_angle : float
+        Anisotropy of the fitted ``w`` and material variograms (see
+        :meth:`PointCloud.fillHoles`).
+    ring_scale : float
+        Width of the ring of certain points used to fit the variograms, as a
+        fraction of the hole's size.
+    max_train : int
+        Largest number of ring points used for a variogram fit.
+    uncertain_only : bool
+        Return only the uncertain points of each realisation.
+    seed : int
+        Random seed.
+
+    Returns
+    -------
+    list[PointCloud]
+        `n_realisations` point clouds, each with all attributes of `pc`, the
+        sampled material in `label` and the sampled displacement along ``w`` in
+        ``"dw"``. Attributes other than `label` and ``"dw"`` are shared with `pc`,
+        not copied.
+
+    Raises
+    ------
+    ValueError
+        If attributes are missing or the probabilities are not valid.
+    """
+    from ._kriging import Variogram, GaussianField, fit_variogram, poly_design, _thin
+    from scipy.spatial import cKDTree
+    from scipy.special import ndtr
+
+    if n_realisations < 1:
+        raise ValueError("n_realisations must be >= 1.")
+    for name in (std, label):
+        if not pc.has_attr(name):
+            raise ValueError(f"Attribute '{name}' not found.")
+    p_names, classes = _probability_attributes(pc, label)
+    if not p_names:
+        raise ValueError(f"No probability attributes '{label}_P<class>' found.")
+
+    sigma = np.asarray(pc.get_attr(std), dtype=float).ravel()
+    P = np.column_stack([np.asarray(pc.get_attr(n), dtype=float) for n in p_names])
+    if P.min() < -1e-9 or np.abs(P.sum(axis=1) - 1.0).max() > 1e-4:
+        raise ValueError(f"'{label}_P<class>' must be >= 0 and sum to 1 at every point.")
+    if np.any(sigma < 0) or not np.all(np.isfinite(sigma)):
+        raise ValueError(f"'{std}' must be finite and >= 0.")
+    labels = np.asarray(pc.get_attr(label))
+
+    uncertain = (sigma > 0) | (P.max(axis=1) < 1.0 - 1e-9)
+    idx = np.flatnonzero(uncertain)
+    n_unc = idx.size
+    frame = pc.frame if frame is None else frame
+    uvw = frame.xyz_to_uvw(pc.points)
+    if np.isnan(uvw[idx]).any():
+        raise ValueError("Some uncertain points are outside the frame.")
+    cdf = np.cumsum(P[idx], axis=1)
+    cdf[:, -1] = 1.0                                      # guard against round-off
+
+    rng = np.random.default_rng(seed)
+    Z = np.empty((n_realisations, n_unc))
+    Q = np.empty((n_realisations, n_unc))
+    if not correlated or n_unc == 0:
+        Z[:] = rng.standard_normal(Z.shape)
+        Q[:] = rng.random(Q.shape)
+    else:
+        groups = (np.asarray(pc.get_attr("hole_id"))[idx].astype(np.int64)
+                  if pc.has_attr("hole_id") else np.zeros(n_unc, dtype=np.int64))
+        by_hole = {} if info is None else {h["hole"]: h for h in info.get("holes", []) if "skipped" not in h}
+        angle = frame.horizontal_angle_uv() + bedding_angle
+        certain = np.flatnonzero(~uncertain & np.isfinite(uvw).all(axis=1))
+        tree = cKDTree(uvw[certain, :2]) if certain.size else None
+
+        for g in np.unique(groups):
+            sel = np.flatnonzero(groups == g)
+            uv_g = uvw[idx[sel], :2]
+            known = by_hole.get(int(g))
+            if known is not None:
+                vw = Variogram(**known["w_variogram"])
+                cv = known.get("attr_variograms", {}).get(label)
+                vc = Variogram(**{k: v for k, v in cv.items() if k != "from_class"}) if cv and "model" in cv else None
+            else:
+                # Fit on the certain points around this group
+                size = float(np.sqrt(np.prod(np.maximum(np.ptp(uv_g, axis=0), 1e-6))))
+                ring = np.empty(0, dtype=np.int64)
+                if tree is not None:
+                    lo, hi = uv_g.min(axis=0) - ring_scale * size, uv_g.max(axis=0) + ring_scale * size
+                    box = certain[np.all((uvw[certain, :2] >= lo) & (uvw[certain, :2] <= hi), axis=1)]
+                    if box.size:
+                        dist, _ = cKDTree(uv_g).query(uvw[box, :2], k=1, distance_upper_bound=ring_scale * size)
+                        ring = _thin(uvw[:, :2], box[np.isfinite(dist)], max_train, rng)
+                if ring.size >= 10:
+                    ur, wr = uvw[ring, :2], uvw[ring, 2]
+                    c0 = ur.mean(axis=0)
+                    sc = float(np.abs(ur - c0).max()) or 1.0
+                    A = poly_design(ur, 1, c0, sc)
+                    resid = wr - A @ np.linalg.lstsq(A, wr, rcond=None)[0]
+                    vw = fit_variogram(ur, resid, variogram, aniso=geometry_aniso, angle=angle, seed=seed)
+                    ind = labels[ring][:, None] == classes[None, :]
+                    props = ind.mean(axis=0)
+                    present = ind.any(axis=0)
+                    if present.sum() > 1:
+                        ref = int(np.argmin(np.where(present, np.abs(props - 0.5), np.inf)))
+                        vc = fit_variogram(ur, ind[:, ref].astype(float), variogram,
+                                           aniso=aniso, angle=angle, seed=seed)
+                    else:
+                        vc = None
+                else:
+                    # Too few certain points around: a range of a quarter of the hole
+                    vw = Variogram(variogram, psill=1.0, range=max(0.25 * size, 1e-3), aniso=geometry_aniso, angle=angle)
+                    vc = Variogram(variogram, psill=1.0, range=max(0.25 * size, 1e-3), aniso=aniso, angle=angle)
+
+            Z[:, sel] = GaussianField(uv_g, vw).sample(rng, n_realisations)
+            Q[:, sel] = ndtr(GaussianField(uv_g, vc).sample(rng, n_realisations)) if vc is not None \
+                else rng.random((n_realisations, sel.size))
+
+    # ---- Realisations
+    keep = idx if uncertain_only else np.arange(pc.points.shape[0])
+    base_attrs = {k: (v[keep] if uncertain_only else v) for k, v in pc.attrs.items() if k not in (label, "dw")}
+    sigma_u, uvw_u = sigma[idx], uvw[idx]
+    out: List[PointCloud] = []
+    for r in range(n_realisations):
+        dw = sigma_u * Z[r]
+        k = (Q[r][:, None] < cdf).argmax(axis=1)          # first class with CDF > q
+
+        moved = uvw_u.copy()
+        moved[:, 2] += dw
+        xyz = pc.points.copy()
+        xyz[idx] = frame.uvw_to_xyz(moved)
+        lab = labels.copy()
+        lab[idx] = classes[k].astype(labels.dtype, copy=False)
+        dw_all = np.zeros(pc.points.shape[0])
+        dw_all[idx] = dw
+
+        real = PointCloud(points=xyz[keep])
+        for name, arr in base_attrs.items():
+            real._attrs[name] = arr                        # shared, not copied
+        real.set_attr(label, lab[keep])
+        real.set_attr("dw", dw_all[keep])
+        real._frame = frame
+        out.append(real)
+    return out
+
 
 def slopeBelow(slope: Slope, seeder: Seeder) -> Slope:
     """
