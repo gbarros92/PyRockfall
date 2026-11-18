@@ -21,6 +21,7 @@ from scipy import ndimage
 from scipy.linalg import lu_factor, lu_solve
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
+from scipy.fft import next_fast_len
 from scipy.spatial.distance import cdist, pdist
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "poly_design",
     "find_holes",
     "fill_holes_uv",
+    "GaussianField",
 ]
 
 VARIOGRAM_MODELS = ("spherical", "exponential", "gaussian", "linear")
@@ -678,3 +680,84 @@ def fill_holes_uv(
         spacing=float(default_spacing if spacing is None else spacing),
         cell=float(cell),
     )
+
+
+# ---------------------------------------------------------------------------
+# Spatially correlated random fields
+# ---------------------------------------------------------------------------
+class GaussianField:
+    """Unit-variance stationary Gaussian random field at fixed 2D points.
+
+    The correlation is that of a :class:`Variogram` (shape, range, anisotropy
+    and nugget): ``rho(h) = 1 - gamma(h) / (psill + nugget)`` away from the
+    origin. The field is simulated on a regular grid by circulant embedding
+    (FFT) and interpolated bilinearly to the points. A bilinear average of
+    correlated grid values has a variance slightly below 1; this is corrected
+    exactly per point, so the field has unit variance at every point. The
+    nugget is added as independent noise.
+
+    A ``"linear"`` variogram has no stationary covariance; it is replaced by a
+    spherical one with the same range.
+
+    Parameters
+    ----------
+    xy : (n, 2) array
+        Points at which the field is evaluated.
+    variogram : Variogram
+        Correlation model.
+    cells_per_range : int
+        Grid resolution, in cells per range (across the shortest axis).
+    max_cells : int
+        Largest number of grid cells along an axis (the grid is coarsened if
+        needed).
+    """
+
+    def __init__(self, xy, variogram: "Variogram", *, cells_per_range: int = 20, max_cells: int = 1024):
+        model = variogram.model if variogram.model != "linear" else "spherical"
+        total = float(variogram.psill + variogram.nugget)
+        self.nugget = float(np.clip(variogram.nugget / total, 0.0, 1.0)) if total > 0 else 0.0
+        self.range = max(float(variogram.range), 1e-9)
+        self._unit = Variogram(model=model, psill=1.0, range=self.range, nugget=0.0)
+        pts = variogram.transform(np.asarray(xy, dtype=float))        # isotropic coordinates
+
+        lo, hi = pts.min(axis=0), pts.max(axis=0)
+        dx = max(self.range / cells_per_range, float((hi - lo).max()) / max_cells, 1e-9)
+        n = np.ceil((hi - lo) / dx).astype(int) + 2                    # grid nodes per axis
+        reach = self.range if model == "spherical" else 2.0 * self.range   # correlation ~ 0 beyond
+        M = [next_fast_len(int(2 * (ni + np.ceil(reach / dx)))) for ni in n]
+        lags = [np.minimum(np.arange(m), m - np.arange(m)) * dx for m in M]
+        c = self._rho(np.hypot(lags[0][:, None], lags[1][None, :]))
+        lam = np.fft.fft2(c).real
+        self.clipped = float(-lam[lam < 0].sum() / np.abs(lam).sum())   # share of negative spectrum
+        self._sqrt_lam = np.sqrt(np.clip(lam, 0, None) / lam.size)
+        self.grid_shape, self.dx = tuple(M), dx
+
+        # Bilinear weights of the 4 surrounding grid nodes, and variance correction
+        g = (pts - lo) / dx
+        self._i0 = np.minimum(np.floor(g).astype(int), n - 2)
+        t = g - self._i0
+        self._w = np.stack([(1 - t[:, 0]) * (1 - t[:, 1]), t[:, 0] * (1 - t[:, 1]),
+                            (1 - t[:, 0]) * t[:, 1], t[:, 0] * t[:, 1]], axis=1)
+        offs = np.array([[0, 0], [1, 0], [0, 1], [1, 1]]) * dx
+        C4 = self._rho(np.linalg.norm(offs[:, None] - offs[None], axis=-1))
+        self._scale = 1.0 / np.sqrt(np.einsum("pa,ab,pb->p", self._w, C4, self._w))
+
+    def _rho(self, h):
+        return 1.0 - self._unit.gamma(h)
+
+    def _interp(self, grid):
+        i, j = self._i0[:, 0], self._i0[:, 1]
+        v = np.stack([grid[i, j], grid[i + 1, j], grid[i, j + 1], grid[i + 1, j + 1]], axis=1)
+        return (v * self._w).sum(axis=1) * self._scale
+
+    def sample(self, rng: np.random.Generator, k: int) -> np.ndarray:
+        """`k` independent realisations of the field at the points, shape (k, n)."""
+        out = []
+        while len(out) < k:
+            xi = rng.standard_normal(self.grid_shape) + 1j * rng.standard_normal(self.grid_shape)
+            f = np.fft.fft2(self._sqrt_lam * xi)        # real and imaginary parts: 2 independent fields
+            out += [self._interp(f.real), self._interp(f.imag)]
+        z = np.array(out[:k])
+        if self.nugget > 0:
+            z = np.sqrt(1 - self.nugget) * z + np.sqrt(self.nugget) * rng.standard_normal(z.shape)
+        return z
