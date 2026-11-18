@@ -14,6 +14,7 @@ from pyrockfall._kriging import (
     poly_design,
     find_holes,
     fill_holes_uv,
+    GaussianField,
 )
 
 
@@ -292,3 +293,33 @@ def test_fill_holes_uv_options_and_empty_result():
         fill_holes_uv(kept, {"label": (label[~in_hole], "ordinal")}, cell=0.9)
     with pytest.raises(ValueError, match="one row per point"):
         fill_holes_uv(kept, {"label": (label, "categorical")}, cell=0.9)
+
+
+# ---------------------------------------------------------------------------
+# GaussianField
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("model", ["spherical", "exponential", "gaussian"])
+def test_gaussian_field_has_unit_variance_and_the_model_correlation(model):
+    rng = np.random.default_rng(0)
+    xy = np.column_stack([np.linspace(0, 30, 61), np.zeros(61)])          # points 0.5 apart on a line
+    v = Variogram(model, psill=1.0, range=6.0, nugget=0.0)
+    z = GaussianField(xy, v).sample(rng, 4000)
+    assert z.shape == (4000, 61)
+    np.testing.assert_allclose(z.var(axis=0).mean(), 1.0, atol=0.05)
+    assert np.abs(z.mean(axis=0)).max() < 0.1
+    for lag in (2, 6, 12):                                               # 1, 3 and 6 apart
+        h = 0.5 * lag
+        rho = np.mean([np.corrcoef(z[:, i], z[:, i + lag])[0, 1] for i in range(0, 61 - lag, 5)])
+        assert rho == pytest.approx(1.0 - v.gamma(h), abs=0.07)
+
+
+def test_gaussian_field_nugget_and_anisotropy():
+    rng = np.random.default_rng(1)
+    xy = np.array([[0.0, 0.0], [3.0, 0.0], [0.0, 3.0]])
+    noisy = GaussianField(xy[:2], Variogram("spherical", psill=0.5, range=60.0, nugget=0.5)).sample(rng, 6000)
+    assert np.corrcoef(noisy[:, 0], noisy[:, 1])[0, 1] == pytest.approx(0.5 * (1 - Variogram("spherical", 1, 60.0).gamma(3.0)), abs=0.05)
+    layered = GaussianField(xy, Variogram("spherical", psill=1.0, range=20.0, aniso=10.0, angle=0.0)).sample(rng, 6000)
+    along = np.corrcoef(layered[:, 0], layered[:, 1])[0, 1]               # along the layers
+    across = np.corrcoef(layered[:, 0], layered[:, 2])[0, 1]              # across them: range 2
+    assert along > 0.7 and abs(across) < 0.07
