@@ -613,6 +613,10 @@ class PointCloud(Model):
         bedding_angle: float = 0.0,
         geometry_aniso: float = 3.0,
         shared_variogram: bool = True,
+        dense_variogram: bool = True,
+        dense_lag: float = 3.0,
+        surface_tol: Optional[float] = 0.15,
+        surface_radius: Optional[float] = None,
         others: str = "nearest",
         seed: int = 0,
         return_info: bool = False,
@@ -632,8 +636,11 @@ class PointCloud(Model):
            enclosed by points, plus empty cells that held points taken out with
            :meth:`removePoints`. Each connected region is one hole.
         2. Create new points in every hole on a regular ``(u, v)`` grid.
-        3. Height: remove a polynomial trend from ``w`` of the points in a ring
-           around the hole, fit a variogram to the residual, krige it at the new
+        3. Height: take the points in a ring around the hole that lie on the main
+           surface (second layers, loose blocks and steps are left out), remove a
+           polynomial trend from their ``w``, fit a variogram to the residual
+           (nugget + short- and long-range structure, from all pairs at short
+           lags, so it describes the roughness of the rock), krige it at the new
            points and add the trend back. Map ``(u, v, w)`` back to ``(x, y, z)``.
         4. Attributes: integer-valued ones by indicator kriging (a probability per
            class, corrected to lie in [0, 1] and sum to 1), the others by ordinary
@@ -683,6 +690,17 @@ class PointCloud(Model):
             than up-dip.
         shared_variogram : bool
             Use one variogram for all classes of a categorical attribute.
+        dense_variogram : bool
+            Fit the height variogram as nugget + short- + long-range structure
+            from all ring points (default), or as one structure on the thinned
+            ring (False, smoother).
+        dense_lag : float
+            Boundary, in metres, between the short- and long-range structures.
+        surface_tol, surface_radius : float
+            Ring points more than `surface_tol` (m) from the median ``w`` of their
+            24 nearest neighbours (within `surface_radius` m, if given) are left
+            out of the height kriging: second layers, loose blocks, steps.
+            ``surface_tol=None`` keeps every point.
         others : {"nearest", "nan"}
             Value given to the attributes that are not kriged: that of the nearest
             existing point, or NaN.
@@ -700,7 +718,12 @@ class PointCloud(Model):
             categorical attribute ``"<name>_P<class>"`` and ``"<name>_Pmax"``; per
             continuous attribute ``"<name>_std"``.
         dict
-            Only with `return_info`.
+            Only with `return_info`: ``holes`` (per hole: size, ring, the height
+            variogram ``w_variogram``, the share of ring points off the surface
+            ``off_surface``, and ``train_idx``, the indices in the output of the
+            points the height was kriged from), ``n_new``, ``spacing``, ``cell``.
+            Pass it to :func:`sampleRealisations` to draw realisations consistent
+            with the kriging.
         """
         if isinstance(attributes, str):
             attributes = [attributes]
@@ -747,8 +770,12 @@ class PointCloud(Model):
             n_closest=n_closest, variogram=variogram, attr_variogram=attr_variogram,
             trend_order=trend_order, nlags=nlags, aniso=aniso,
             angle=frame.horizontal_angle_uv() + bedding_angle, w_aniso=geometry_aniso,
-            shared_variogram=shared_variogram, seed=seed,
+            shared_variogram=shared_variogram, dense_variogram=dense_variogram, dense_lag=dense_lag,
+            surface_tol=surface_tol, surface_radius=surface_radius, seed=seed,
         )
+        for h in res["holes"]:
+            if "train_idx" in h:                    # indices into the output (existing points come first)
+                h["train_idx"] = idx_ok[h["train_idx"]]
         m = res["uvw"].shape[0]
 
         # ---- assemble: existing points followed by the new ones
