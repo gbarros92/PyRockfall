@@ -9,12 +9,18 @@ import pytest
 
 from pyrockfall._kriging import (
     Variogram,
+    NestedVariogram,
+    variogram_from_dict,
     fit_variogram,
+    fit_nested_variogram,
+    surface_mask,
     ordinary_kriging,
     poly_design,
     find_holes,
     fill_holes_uv,
     GaussianField,
+    RandomField,
+    conditional_simulation,
 )
 
 
@@ -323,3 +329,139 @@ def test_gaussian_field_nugget_and_anisotropy():
     along = np.corrcoef(layered[:, 0], layered[:, 1])[0, 1]               # along the layers
     across = np.corrcoef(layered[:, 0], layered[:, 2])[0, 1]              # across them: range 2
     assert along > 0.7 and abs(across) < 0.07
+
+
+def test_gaussian_field_resolution_keeps_the_short_range_roughness():
+    rng = np.random.default_rng(2)
+    xy = np.column_stack([np.arange(0, 20, 0.1), np.zeros(200)])            # points 0.1 apart
+    v = Variogram("spherical", psill=1.0, range=20.0)
+    for res, tol in ((None, None), (0.1, 0.2)):
+        z = GaussianField(xy, v, resolution=res).sample(rng, 3000)
+        g1 = 0.5 * np.mean((z[:, 1:] - z[:, :-1]) ** 2)                    # semivariance at 0.1
+        if res is None:
+            assert abs(g1 / v.gamma(0.1) - 1.0) > 0.5                      # grid of range/20 = 1 m: wrong at 0.1 m
+        else:
+            assert g1 == pytest.approx(v.gamma(0.1), rel=tol)
+        np.testing.assert_allclose(z.var(axis=0).mean(), 1.0, atol=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Nested variograms, surface texture and conditional simulation
+# ---------------------------------------------------------------------------
+
+def test_nested_variogram_sums_its_structures():
+    nv = NestedVariogram([("spherical", 0.2, 1.0), ("exponential", 1.0, 10.0)], nugget=0.05, aniso=2.0, angle=30.0)
+    h = np.array([0.0, 0.5, 2.0, 30.0])
+    expected = Variogram("spherical", 0.2, 1.0).gamma(h) + Variogram("exponential", 1.0, 10.0).gamma(h) + np.where(h > 0, 0.05, 0)
+    np.testing.assert_allclose(nv.gamma(h), expected)
+    assert nv.psill == pytest.approx(1.2)
+    xy = np.array([[1.0, 2.0], [-3.0, 0.5]])
+    np.testing.assert_allclose(nv.transform(xy), Variogram(aniso=2.0, angle=30.0).transform(xy))
+    assert variogram_from_dict(nv.to_dict()) == nv
+    single = Variogram("gaussian", 0.7, 4.0, 0.1, 3.0, 5.0)
+    assert variogram_from_dict(dict(single.to_dict(), from_class="2")) == single
+    with pytest.raises(ValueError, match="Unknown variogram model"):
+        NestedVariogram([("cubic", 1.0, 1.0)])
+    # kriging accepts it and stays exact at the data
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(0, 10, (60, 2))
+    vals = np.sin(pts[:, 0])
+    est, var = ordinary_kriging(pts, vals, pts[:5], nv)
+    np.testing.assert_allclose(est, vals[:5], atol=1e-8)
+    np.testing.assert_allclose(var, 0.0, atol=1e-8)
+
+
+def test_fit_nested_variogram_sees_the_short_range_roughness():
+    rng = np.random.default_rng(3)
+    gu, gv = np.meshgrid(np.arange(0, 40, 0.15), np.arange(0, 40, 0.15), indexing="ij")
+    xy = np.column_stack([gu.ravel(), gv.ravel()])                         # 71 000 points
+    truth = NestedVariogram([("spherical", 0.05, 1.0), ("spherical", 1.0, 15.0)], nugget=0.0)
+    z = RandomField(xy, truth, resolution=0.15).sample(rng, 1)[0]
+    nested = fit_nested_variogram(xy, z, short_model="spherical", dense_lag=3.0, seed=1)
+    (m1, c1, a1), (m2, c2, a2) = nested.structures
+    assert (m1, m2) == ("spherical", "spherical")
+    # the short structure and the slope at the origin are recovered ...
+    for h in (0.15, 0.5, 1.0):
+        assert nested.gamma(h) == pytest.approx(truth.gamma(h), rel=0.35)
+    assert 0.3 < a1 < 3.0
+    # ... which a fit on a thinned subset cannot see: it extrapolates them, far off
+    thinned = fit_variogram(xy, z, max_points=2000, seed=1)
+    err = lambda m: abs(float(m.gamma(0.15)) - float(truth.gamma(0.15)))
+    assert err(thinned) > 2 * err(nested)
+    with pytest.raises(ValueError, match="bounded models"):
+        fit_nested_variogram(xy[:100], z[:100], "linear")
+    flat = fit_nested_variogram(xy[:50], np.ones(50))
+    assert flat.gamma(1.0) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_surface_mask_flags_second_layers_and_strays():
+    rng = np.random.default_rng(4)
+    uv = rng.uniform(0, 20, (8000, 2))
+    w = 0.05 * np.sin(uv[:, 0]) + 0.01 * rng.standard_normal(8000)
+    layer = (uv[:, 0] < 5) & (rng.random(8000) < 0.25)                     # a sparse second layer
+    stray = rng.random(8000) < 0.005
+    w = w + np.where(layer, 0.6, 0.0) + np.where(stray & ~layer, -1.0, 0.0)
+    on = surface_mask(uv, w, radius=0.5, tol=0.15)
+    assert on[~layer & ~stray].mean() > 0.99
+    assert on[layer].mean() < 0.02
+    assert not on[stray & ~layer].any()
+    assert surface_mask(uv, w, radius=0.5, n_iter=1)[layer].mean() > on[layer].mean()   # later passes help
+    assert surface_mask(uv, w)[layer].mean() < 0.01                       # 24 nearest: more robust
+    assert surface_mask(np.empty((0, 2)), np.empty(0)).shape == (0,)
+
+
+def test_random_field_variance_is_the_sill():
+    rng = np.random.default_rng(5)
+    xy = rng.uniform(0, 10, (300, 2))
+    nv = NestedVariogram([("spherical", 0.3, 1.0), ("gaussian", 0.5, 6.0)], nugget=0.2, aniso=2.0)
+    z = RandomField(xy, nv, resolution=0.2).sample(rng, 4000)
+    assert z.shape == (4000, 300)
+    assert z.var(axis=0).mean() == pytest.approx(1.0, abs=0.05)
+    i, j = 0, 1
+    h = np.linalg.norm(nv.transform(xy[[i]]) - nv.transform(xy[[j]]))
+    cov = np.mean(z[:, i] * z[:, j])
+    assert cov == pytest.approx(1.0 - nv.gamma(h), abs=0.06)
+
+
+def test_conditional_simulation_honours_the_data_and_the_kriging_variance():
+    rng = np.random.default_rng(6)
+    v = NestedVariogram([("spherical", 0.2, 1.0), ("spherical", 1.0, 8.0)])
+    data = rng.uniform(0, 20, (150, 2))
+    vals = gaussian_field(data, Variogram("spherical", 1.2, 8.0), seed=6)
+    new = np.column_stack([rng.uniform(5, 15, 400), rng.uniform(5, 15, 400)])
+    new[:3] = data[:3]                                                     # some at the data
+    real, est, var = conditional_simulation(data, vals, new, v, 600, rng=rng, resolution=0.1)
+    assert real.shape == (600, 400)
+    np.testing.assert_allclose(real[:, :3], np.broadcast_to(vals[:3], (600, 3)), atol=1e-6)
+    e2, v2 = ordinary_kriging(data, vals, new, v)
+    np.testing.assert_allclose(est, e2, atol=1e-10)
+    np.testing.assert_allclose(var, v2, atol=1e-10)
+    far = var > 0.2
+    assert np.abs(real.mean(axis=0) - est)[far].max() < 4 * np.sqrt(var[far].max() / 600)
+    assert np.median(real.var(axis=0)[far] / var[far]) == pytest.approx(1.0, abs=0.08)
+    empty, *_ = conditional_simulation(data, vals, np.empty((0, 2)), v, 3, rng=rng)
+    assert empty.shape == (3, 0)
+
+
+def test_fill_holes_uv_ignores_a_second_layer_and_records_its_training_points():
+    uvw, label, in_hole = plane_with_hole()
+    rng = np.random.default_rng(7)
+    near = np.hypot(uvw[:, 0] - 30.0, uvw[:, 1] - 10.0) < 9.0
+    layer = near & ~in_hole & (uvw[:, 1] > 10.0) & (rng.random(len(uvw)) < 0.3)   # debris above the face
+    uvw = uvw.copy()
+    uvw[layer, 2] += 0.8
+    kept = uvw[~in_hole]
+    w_true = lambda p: 0.3 * np.sin(p[:, 0] / 6.0) + 0.02 * (p[:, 1] - 10.0) ** 2 / 10.0
+
+    clean = fill_holes_uv(kept, cell=0.8)
+    raw = fill_holes_uv(kept, cell=0.8, surface_tol=None)
+    rmse = lambda r: np.sqrt(np.mean((r["uvw"][:, 2] - w_true(r["uvw"])) ** 2))
+    assert rmse(clean) < 0.06
+    assert rmse(raw) > 2 * rmse(clean)
+    h = clean["holes"][0]
+    assert 0.03 < h["off_surface"] < 0.3                                   # the layer's share of the ring
+    assert not layer[~in_hole][h["train_idx"]].any()                       # no debris among the data
+    assert h["n_train"] == len(h["train_idx"])
+    assert "structures" in h["w_variogram"]
+    single = fill_holes_uv(kept, cell=0.8, dense_variogram=False)["holes"][0]["w_variogram"]
+    assert "model" in single
