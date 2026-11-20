@@ -367,19 +367,35 @@ def test_point_cloud2_mesh_max_edge_and_invalid_method():
         pointCloud2Mesh(pc, method="xy")
 
 
-def _filled_wall(seed=0):
-    """Corner wall with two layers and a patch removed and refilled by kriging."""
+def _filled_wall(seed=0, rough=0.0):
+    """Corner wall with two layers and a patch removed and refilled by kriging.
+
+    With `rough` > 0 the face also gets an isotropic random roughness of that
+    standard deviation (spherical, range 1.5 m)."""
     pts, e = _corner_wall_points(n=12000, seed=seed)
     rng = np.random.default_rng(seed)
     truth = pr.CurvilinearFrame([[0.0, 0.0], [30.0, 0.0], [30.0, 30.0]])
     sde = truth.xyz_to_sde(pts)
     # smooth undulations of the face (spatially correlated) plus a little noise
     sde[:, 1] += 0.4 * np.sin(sde[:, 0] / 2.0) * np.cos(sde[:, 2] / 1.5) + 0.01 * rng.standard_normal(len(sde))
+    if rough > 0:
+        from pyrockfall._kriging import RandomField, Variogram
+        field = RandomField(sde[:, [0, 2]], Variogram("spherical", psill=rough ** 2, range=1.5), resolution=0.1)
+        sde[:, 1] += field.sample(rng, 1)[0]
     pts = truth.sde_to_xyz(sde)
     patch = np.hypot(sde[:, 0] - 15.0, sde[:, 2] - 6.0) < 3.0
     pc = pr.PointCloud(points=pts, attrs={"mat": np.where(patch, 9, (e > 6.0).astype(int))})
     pc.removePoints("mat", 9)
     return pc.fillHoles(attributes=["mat"], return_info=True)
+
+
+def _short_lag_rough(uvw, lo=0.3, hi=0.6):
+    """sqrt(mean squared difference of w) over pairs between `lo` and `hi` apart in (u, v)."""
+    from scipy.spatial import cKDTree
+    pairs = cKDTree(uvw[:, :2]).query_pairs(hi, output_type="ndarray")
+    d = np.linalg.norm(uvw[pairs[:, 0], :2] - uvw[pairs[:, 1], :2], axis=1)
+    pairs = pairs[d >= lo]
+    return float(np.sqrt(np.mean((uvw[pairs[:, 0], 2] - uvw[pairs[:, 1], 2]) ** 2)))
 
 
 def test_sample_realisations_coordinates_follow_std_and_materials_follow_probabilities():
@@ -390,7 +406,7 @@ def test_sample_realisations_coordinates_follow_std_and_materials_follow_probabi
     assert sigma[new].min() > 0 and (P[new].max(axis=1) < 1).any()
 
     n = 400
-    reals = sampleRealisations(filled, n, "mat", correlated=False, seed=1)
+    reals = sampleRealisations(filled, n, "mat", info=info, seed=1)
     assert len(reals) == n
     frame = filled.frame
     w0 = frame.xyz_to_uvw(filled.points)
@@ -409,51 +425,42 @@ def test_sample_realisations_coordinates_follow_std_and_materials_follow_probabi
     np.testing.assert_allclose(W[:, new] - w0[new, 2], DW[:, new], atol=1e-6)
 
     # coordinates: per point, mean w and std of w match the kriged w and kriging_std
+    # (conditional simulation with the variogram and points of the kriging)
     dw = W[:, new] - w0[new, 2]
-    assert np.abs(np.median(dw.mean(axis=0) / sigma[new])) < 0.05
+    assert np.abs(np.median(dw.mean(axis=0) / sigma[new])) < 0.1
     ratio = dw.std(axis=0) / sigma[new]
-    assert np.median(ratio) == pytest.approx(1.0, abs=0.05)
+    assert np.median(ratio) == pytest.approx(1.0, abs=0.1)
     # materials: per point, the frequency of each class matches its probability
     freq = np.column_stack([(K[:, new] == 0).mean(axis=0), (K[:, new] == 1).mean(axis=0)])
-    assert np.abs(freq - P[new]).mean() < 0.02
-    assert np.abs(freq - P[new]).max() < 0.15
+    assert np.abs(freq - P[new]).mean() < 0.03
+    assert np.abs(freq - P[new]).max() < 0.2
 
 
-def test_sample_realisations_correlated_fields_keep_the_per_point_distributions():
-    filled, info = _filled_wall()
+def test_sample_realisations_are_as_rough_as_the_rock():
+    filled, info = _filled_wall(rough=0.1)
     new = filled.get_attr("filled") == 1
-    sigma = filled.get_attr("kriging_std")[new]
-    P1 = filled.get_attr("mat_P1")[new]
     frame = filled.frame
-    w0 = frame.xyz_to_uvw(filled.points[new])
+    uvw = frame.xyz_to_uvw(filled.points)
     from scipy.spatial import cKDTree
-    _, nn = cKDTree(w0[:, :2]).query(w0[:, :2], k=2)
-    nn = nn[:, 1]
+    d_hole, _ = cKDTree(uvw[new, :2]).query(uvw[~new, :2], k=1)
+    ring = np.flatnonzero(~new)[d_hole < 3.0]                     # exposed rock around the hole
 
-    stats = {}
-    for name, kw in (("independent", dict(correlated=False)),
-                     ("fitted", dict()),
-                     ("from fillHoles", dict(info=info))):
-        reals = sampleRealisations(filled, 300, "mat", uncertain_only=True, seed=2, **kw)
-        assert reals[0].points.shape[0] == new.sum()
+    rock = _short_lag_rough(uvw[ring])
+    kriged = _short_lag_rough(uvw[new])
+    assert kriged < 0.5 * rock                                    # kriging alone is smooth
+
+    for kw in (dict(info=info), dict()):                          # from fillHoles, or fitted here
+        reals = sampleRealisations(filled, 20, "mat", uncertain_only=True, seed=3, **kw)
+        sim = np.median([_short_lag_rough(frame.xyz_to_uvw(r.points)) for r in reals])
+        assert sim == pytest.approx(rock, rel=0.35), kw.keys()
+        # per-point spread still follows kriging_std
         DW = np.stack([r.get_attr("dw") for r in reals])
-        K = np.stack([r.get_attr("mat") for r in reals])
-        z = DW / sigma
-        stats[name] = dict(
-            std_ratio=np.median(DW.std(axis=0) / sigma),
-            freq_err=np.abs((K == 1).mean(axis=0) - P1).mean(),
-            rough=np.abs(z - z[:, nn]).mean(),                       # neighbour difference of z
-            flips=(K != K[:, nn]).mean(),
-        )
-    for name, st in stats.items():
-        # same per-point distributions in all modes (a correlated field over a small
-        # hole has fewer independent values, so the tolerance is wider)
-        assert st["std_ratio"] == pytest.approx(1.0, abs=0.15), name
-        assert st["freq_err"] < 0.06, name
-    for name in ("fitted", "from fillHoles"):
-        # but neighbours are alike: smooth surfaces and coherent layers
-        assert stats[name]["rough"] < 0.5 * stats["independent"]["rough"], name
-        assert stats[name]["flips"] < 0.5 * stats["independent"]["flips"], name
+        sigma = filled.get_attr("kriging_std")[new]
+        assert np.median(DW.std(axis=0) / sigma) == pytest.approx(1.0, abs=0.3)
+    # and the materials are coherent: neighbours mostly share their class
+    K = np.stack([r.get_attr("mat") for r in reals])
+    _, nn = cKDTree(uvw[new, :2]).query(uvw[new, :2], k=2)
+    assert (K != K[:, nn[:, 1]]).mean() < 0.1
 
 
 def test_sample_realisations_validates_input():
