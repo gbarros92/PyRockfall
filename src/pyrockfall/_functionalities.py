@@ -5,7 +5,7 @@ User functionalities in pyrockfall
 This module implements functions to facilitate rockfall simulation.
 """
 import numpy as np
-from scipy.spatial import Delaunay
+from scipy.spatial import Delaunay, cKDTree
 from numpy.typing import NDArray
 from typing import Union, List, Tuple, Optional, Callable, Literal, Dict, Any
 
@@ -390,7 +390,6 @@ def sampleRealisations(
     label: str,
     *,
     std: str = "kriging_std",
-    correlated: bool = True,
     info: Optional[Dict[str, Any]] = None,
     frame=None,
     variogram: str = "spherical",
@@ -399,6 +398,10 @@ def sampleRealisations(
     bedding_angle: float = 0.0,
     ring_scale: float = 1.0,
     max_train: int = 2000,
+    dense_lag: float = 3.0,
+    surface_tol: Optional[float] = 0.15,
+    surface_radius: Optional[float] = None,
+    resolution: Optional[float] = None,
     uncertain_only: bool = False,
     seed: int = 0,
 ) -> List[PointCloud]:
@@ -406,37 +409,39 @@ def sampleRealisations(
     Draw realisations of a point cloud whose position and material are uncertain,
     e.g. the output of :meth:`PointCloud.fillHoles`.
 
-    Each point carries the standard deviation of its height above the face plane
-    (attribute `std`) and one probability per material (attributes
+    Each uncertain point carries the standard deviation of its height above the
+    face plane (attribute `std`) and one probability per material (attributes
     ``<label>_P<class>``, summing to 1). In every realisation:
 
-    - **Coordinates:** the height above the face plane is drawn as
-      ``w_r = w + std * z`` with ``z ~ N(0, 1)``, and the point moves by
-      ``w_r - w`` along the ``w`` axis of the curvilinear frame, keeping its
-      ``(u, v)``.
-    - **Material:** ``q ~ U[0, 1)`` is drawn and the point gets the first class
-      whose cumulative probability exceeds ``q`` (inverse CDF), so class ``k``
-      is drawn with probability ``P_k``.
+    - **Coordinates** (conditional simulation): the height above the face plane
+      is ``w_r = w + (s - s_ok)``, where ``s`` is a random surface with the
+      variogram of the height (roughness included) and ``s_ok`` is its kriging
+      from the existing points around the hole. ``s - s_ok`` is a draw of the
+      kriging error, so over many realisations each point has mean ``w`` and
+      standard deviation `std`, while each realisation is as rough as the
+      variogram everywhere and joins the existing rock at the edge of the hole.
+      The point moves by ``w_r - w`` along the ``w`` axis of the curvilinear
+      frame, keeping its ``(u, v)``.
+    - **Material:** ``q = Phi(g)`` with ``g`` a spatially correlated Gaussian
+      field (coherent layers), and the point gets the first class whose
+      cumulative probability exceeds ``q`` (inverse CDF), so class ``k`` is drawn
+      with probability ``P_k``.
 
     Points with ``std == 0`` and a probability of 1 for one class are certain and
     are copied unchanged.
 
-    With `correlated` (default), ``z`` and ``q = Phi(g)`` come from spatially
-    correlated Gaussian fields instead of independent draws, so each realisation
-    is a smooth surface with coherent layers ("probability-field simulation").
-    The per-point distributions are the same either way: over many realisations
-    each point's ``w`` has mean ``w`` and standard deviation `std`, and class
-    ``k`` appears with frequency ``P_k``. Only neighbouring points become alike.
+    The variograms and conditioning points are set per hole (attribute
+    ``"hole_id"``; one group if it is missing):
 
-    The correlation is set per hole (attribute ``"hole_id"``; one group if it is
-    missing):
-
-    - from `info`, the dict returned by ``fillHoles(..., return_info=True)``,
-      which holds the variograms used to fill each hole; or
-    - otherwise fitted on the certain points around the hole, as
-      :meth:`PointCloud.fillHoles` does: the variogram of the detrended ``w``, and
-      the indicator variogram of the class whose proportion is closest to 0.5,
-      with ranges `aniso` times longer along the layers.
+    - from `info`, the dict returned by ``fillHoles(..., return_info=True)``:
+      the variograms and the points used to fill each hole, so the spread of
+      ``w`` matches `std` exactly; or
+    - otherwise from the certain points around the hole that lie on the main
+      surface (see :func:`~._kriging.surface_mask`): the nested variogram of
+      the detrended ``w`` (see :func:`~._kriging.fit_nested_variogram`), and the
+      indicator variogram of the class whose proportion is closest to 0.5,
+      with ranges `aniso` times longer along the layers. The spread of ``w``
+      then matches `std` only approximately.
 
     Parameters
     ----------
@@ -448,10 +453,10 @@ def sampleRealisations(
         Material attribute. Its probabilities are ``<label>_P<class>``.
     std : str
         Attribute with the standard deviation of the height above the face plane.
-    correlated : bool
-        Spatially correlated draws (default) or independent draws per point.
     info : dict, optional
-        Output of ``fillHoles(..., return_info=True)``, to reuse its variograms.
+        Output of ``fillHoles(..., return_info=True)``, to reuse its variograms
+        and conditioning points. Its indices refer to the cloud returned by that
+        call.
     frame : CurvilinearFrame, optional
         Frame in which ``w`` is measured. Defaults to the frame of `pc` (the one
         used to fill the holes, if `pc` came straight from :meth:`fillHoles`).
@@ -461,10 +466,17 @@ def sampleRealisations(
         Anisotropy of the fitted ``w`` and material variograms (see
         :meth:`PointCloud.fillHoles`).
     ring_scale : float
-        Width of the ring of certain points used to fit the variograms, as a
+        Width of the ring of certain points used when `info` is not given, as a
         fraction of the hole's size.
     max_train : int
-        Largest number of ring points used for a variogram fit.
+        Largest number of ring points used as conditioning data.
+    dense_lag, surface_tol, surface_radius : float
+        As in :meth:`PointCloud.fillHoles`, when `info` is not given.
+    resolution : float, optional
+        Grid spacing of the simulated surfaces. Defaults, per hole, to half the
+        spacing of its points, so the roughness between neighbouring points is
+        reproduced (a coarser grid is faster but slightly too rough at the
+        shortest distances).
     uncertain_only : bool
         Return only the uncertain points of each realisation.
     seed : int
@@ -483,7 +495,8 @@ def sampleRealisations(
     ValueError
         If attributes are missing or the probabilities are not valid.
     """
-    from ._kriging import Variogram, GaussianField, fit_variogram, poly_design, _thin
+    from ._kriging import (Variogram, GaussianField, RandomField, conditional_simulation, fit_variogram,
+                           fit_nested_variogram, poly_design, surface_mask, variogram_from_dict, _thin)
     from scipy.spatial import cKDTree
     from scipy.special import ndtr
 
@@ -504,6 +517,7 @@ def sampleRealisations(
         raise ValueError(f"'{std}' must be finite and >= 0.")
     labels = np.asarray(pc.get_attr(label))
 
+    N = pc.points.shape[0]
     uncertain = (sigma > 0) | (P.max(axis=1) < 1.0 - 1e-9)
     idx = np.flatnonzero(uncertain)
     n_unc = idx.size
@@ -515,69 +529,92 @@ def sampleRealisations(
     cdf[:, -1] = 1.0                                      # guard against round-off
 
     rng = np.random.default_rng(seed)
-    Z = np.empty((n_realisations, n_unc))
+    DW = np.zeros((n_realisations, n_unc))
     Q = np.empty((n_realisations, n_unc))
-    if not correlated or n_unc == 0:
-        Z[:] = rng.standard_normal(Z.shape)
-        Q[:] = rng.random(Q.shape)
-    else:
-        groups = (np.asarray(pc.get_attr("hole_id"))[idx].astype(np.int64)
-                  if pc.has_attr("hole_id") else np.zeros(n_unc, dtype=np.int64))
-        by_hole = {} if info is None else {h["hole"]: h for h in info.get("holes", []) if "skipped" not in h}
-        angle = frame.horizontal_angle_uv() + bedding_angle
-        certain = np.flatnonzero(~uncertain & np.isfinite(uvw).all(axis=1))
-        tree = cKDTree(uvw[certain, :2]) if certain.size else None
+    groups = (np.asarray(pc.get_attr("hole_id"))[idx].astype(np.int64)
+              if pc.has_attr("hole_id") else np.zeros(n_unc, dtype=np.int64))
+    by_hole = {} if info is None else {h["hole"]: h for h in info.get("holes", []) if "skipped" not in h}
+    angle = frame.horizontal_angle_uv() + bedding_angle
+    certain = np.flatnonzero(~uncertain & np.isfinite(uvw).all(axis=1))
+    tree = cKDTree(uvw[certain, :2]) if certain.size else None
 
-        for g in np.unique(groups):
-            sel = np.flatnonzero(groups == g)
-            uv_g = uvw[idx[sel], :2]
-            known = by_hole.get(int(g))
-            if known is not None:
-                vw = Variogram(**known["w_variogram"])
-                cv = known.get("attr_variograms", {}).get(label)
-                vc = Variogram(**{k: v for k, v in cv.items() if k != "from_class"}) if cv and "model" in cv else None
-            else:
-                # Fit on the certain points around this group
-                size = float(np.sqrt(np.prod(np.maximum(np.ptp(uv_g, axis=0), 1e-6))))
-                ring = np.empty(0, dtype=np.int64)
-                if tree is not None:
-                    lo, hi = uv_g.min(axis=0) - ring_scale * size, uv_g.max(axis=0) + ring_scale * size
-                    box = certain[np.all((uvw[certain, :2] >= lo) & (uvw[certain, :2] <= hi), axis=1)]
-                    if box.size:
-                        dist, _ = cKDTree(uv_g).query(uvw[box, :2], k=1, distance_upper_bound=ring_scale * size)
-                        ring = _thin(uvw[:, :2], box[np.isfinite(dist)], max_train, rng)
-                if ring.size >= 10:
-                    ur, wr = uvw[ring, :2], uvw[ring, 2]
+    for g in (np.unique(groups) if n_unc else []):
+        sel = np.flatnonzero(groups == g)
+        uv_g = uvw[idx[sel], :2]
+        sp_g = _point_spacing(uv_g)
+        res_g = resolution if resolution is not None else (None if sp_g is None else 0.5 * sp_g)
+        vw = vc = train = None
+
+        known = by_hole.get(int(g))
+        if known is not None:
+            vw = variogram_from_dict(known["w_variogram"])
+            cv = known.get("attr_variograms", {}).get(label)
+            vc = variogram_from_dict(cv) if cv and "model" in cv else None
+            t = known.get("train_idx")
+            if t is not None:
+                t = np.asarray(t, dtype=np.int64)
+                if t.size and t.min() >= 0 and t.max() < N and not uncertain[t].any():
+                    train = t
+
+        size = float(np.sqrt(np.prod(np.maximum(np.ptp(uv_g, axis=0), 1e-6))))
+        if known is None or train is None:
+            # Conditioning points: certain points on the main surface around the group
+            ring = np.empty(0, dtype=np.int64)
+            if tree is not None:
+                lo, hi = uv_g.min(axis=0) - ring_scale * size, uv_g.max(axis=0) + ring_scale * size
+                box = certain[np.all((uvw[certain, :2] >= lo) & (uvw[certain, :2] <= hi), axis=1)]
+                if box.size:
+                    dist, _ = cKDTree(uv_g).query(uvw[box, :2], k=1, distance_upper_bound=ring_scale * size)
+                    ring = box[np.isfinite(dist)]
+            if surface_tol is not None and ring.size >= 3:
+                on = surface_mask(uvw[ring, :2], uvw[ring, 2], radius=surface_radius, tol=surface_tol)
+                if on.sum() >= 3:
+                    ring = ring[on]
+            if ring.size >= 10:
+                train = _thin(uvw[:, :2], ring, max_train, rng)
+                if known is None:
+                    ur = uvw[train, :2]
                     c0 = ur.mean(axis=0)
                     sc = float(np.abs(ur - c0).max()) or 1.0
-                    A = poly_design(ur, 1, c0, sc)
-                    resid = wr - A @ np.linalg.lstsq(A, wr, rcond=None)[0]
-                    vw = fit_variogram(ur, resid, variogram, aniso=geometry_aniso, angle=angle, seed=seed)
-                    ind = labels[ring][:, None] == classes[None, :]
+                    coef = np.linalg.lstsq(poly_design(ur, 1, c0, sc), uvw[train, 2], rcond=None)[0]
+                    resid = uvw[ring, 2] - poly_design(uvw[ring, :2], 1, c0, sc) @ coef
+                    if variogram == "linear":
+                        vw = fit_variogram(uvw[ring, :2], resid, variogram, aniso=geometry_aniso, angle=angle, seed=seed)
+                    else:
+                        vw = fit_nested_variogram(uvw[ring, :2], resid, variogram, dense_lag=dense_lag,
+                                                  aniso=geometry_aniso, angle=angle, max_points=max_train, seed=seed)
+                    ind = labels[train][:, None] == classes[None, :]
                     props = ind.mean(axis=0)
                     present = ind.any(axis=0)
                     if present.sum() > 1:
                         ref = int(np.argmin(np.where(present, np.abs(props - 0.5), np.inf)))
                         vc = fit_variogram(ur, ind[:, ref].astype(float), variogram,
                                            aniso=aniso, angle=angle, seed=seed)
-                    else:
-                        vc = None
-                else:
-                    # Too few certain points around: a range of a quarter of the hole
-                    vw = Variogram(variogram, psill=1.0, range=max(0.25 * size, 1e-3), aniso=geometry_aniso, angle=angle)
-                    vc = Variogram(variogram, psill=1.0, range=max(0.25 * size, 1e-3), aniso=aniso, angle=angle)
+            elif known is None:
+                # Too few certain points around: a range of a quarter of the hole
+                vw = Variogram(variogram, psill=1.0, range=max(0.25 * size, 1e-3), aniso=geometry_aniso, angle=angle)
+                vc = Variogram(variogram, psill=1.0, range=max(0.25 * size, 1e-3), aniso=aniso, angle=angle)
 
-            Z[:, sel] = GaussianField(uv_g, vw).sample(rng, n_realisations)
-            Q[:, sel] = ndtr(GaussianField(uv_g, vc).sample(rng, n_realisations)) if vc is not None \
-                else rng.random((n_realisations, sel.size))
+        # ---- coordinates: kriging error drawn by conditional simulation
+        if train is not None:
+            DW[:, sel], _, _ = conditional_simulation(uvw[train, :2], np.zeros(train.size), uv_g, vw,
+                                                      n_realisations, rng=rng, resolution=res_g)
+        else:
+            # no conditioning points: an unconditional surface scaled to `std`
+            z = RandomField(uv_g, vw, resolution=res_g).sample(rng, n_realisations)
+            DW[:, sel] = sigma[idx[sel]] * z / np.sqrt(max(vw.psill + vw.nugget, 1e-300))
+
+        # ---- materials: probability field
+        Q[:, sel] = ndtr(GaussianField(uv_g, vc).sample(rng, n_realisations)) if vc is not None \
+            else rng.random((n_realisations, sel.size))
 
     # ---- Realisations
-    keep = idx if uncertain_only else np.arange(pc.points.shape[0])
+    keep = idx if uncertain_only else np.arange(N)
     base_attrs = {k: (v[keep] if uncertain_only else v) for k, v in pc.attrs.items() if k not in (label, "dw")}
-    sigma_u, uvw_u = sigma[idx], uvw[idx]
+    uvw_u = uvw[idx]
     out: List[PointCloud] = []
     for r in range(n_realisations):
-        dw = sigma_u * Z[r]
+        dw = DW[r]
         k = (Q[r][:, None] < cdf).argmax(axis=1)          # first class with CDF > q
 
         moved = uvw_u.copy()
@@ -586,7 +623,7 @@ def sampleRealisations(
         xyz[idx] = frame.uvw_to_xyz(moved)
         lab = labels.copy()
         lab[idx] = classes[k].astype(labels.dtype, copy=False)
-        dw_all = np.zeros(pc.points.shape[0])
+        dw_all = np.zeros(N)
         dw_all[idx] = dw
 
         real = PointCloud(points=xyz[keep])
@@ -597,6 +634,17 @@ def sampleRealisations(
         real._frame = frame
         out.append(real)
     return out
+
+
+def _point_spacing(uv, n: int = 5000) -> Optional[float]:
+    """Median nearest-neighbour distance of 2D points (on a subset of `n`)."""
+    uv = np.asarray(uv, dtype=float)
+    if uv.shape[0] < 2:
+        return None
+    sub = uv if uv.shape[0] <= n else uv[np.random.default_rng(0).choice(uv.shape[0], n, replace=False)]
+    d, _ = cKDTree(uv).query(sub, k=2)
+    s = float(np.median(d[:, 1]))
+    return s if s > 0 else None
 
 
 def slopeBelow(slope: Slope, seeder: Seeder) -> Slope:
