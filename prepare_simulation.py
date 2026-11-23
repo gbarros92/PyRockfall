@@ -312,7 +312,16 @@ def stage_stations(args, frame, filled) -> np.ndarray:
     """Stage 4: the s positions of the profiles."""
     s = frame.xyz_to_sde(filled.points)[:, 0]
     s = s[np.isfinite(s)]
-    lo, hi = (args.s_range if args.s_range else (s.min(), s.max()))
+    if args.s_range:
+        lo, hi = args.s_range
+    else:
+        # Past the ends the frame only extrapolates; a few metres is fine, far beyond is a bad mapping.
+        m = args.end_margin
+        inside = (s >= -m) & (s <= frame.length + m)
+        if not inside.all():
+            print(f"[stations] {np.count_nonzero(~inside)} points map more than {m:g} m past the frame ends "
+                  f"(s = {s.min():.1f} .. {s.max():.1f}, frame {frame.length:.1f} m); no stations there")
+        lo, hi = s[inside].min(), s[inside].max()
     stations = np.arange(lo + 0.5 * args.spacing, hi, args.spacing)
     print(f"[stations] {stations.size} stations every {args.spacing:g} m, s = {stations[0]:.2f} .. {stations[-1]:.2f}")
     return stations
@@ -667,6 +676,8 @@ def main() -> None:
     g.add_argument("--slab", type=float, help="Slab thickness around each station [m]. Default: --spacing")
     g.add_argument("--node-step", type=float, default=0.5, help="Node spacing of the profiles [m]. Default: 0.5")
     g.add_argument("--s-range", type=float, nargs=2, metavar=("S_MIN", "S_MAX"), help="Only stations in this s range.")
+    g.add_argument("--end-margin", type=float, default=10.0,
+                   help="Without --s-range, stations reach at most this far (m) past the frame ends. Default: 10")
     g = ap.add_argument_group("realisations")
     g.add_argument("-N", "--n-realisations", type=int, default=50, help="Default: 50")
     g.add_argument("--seed", type=int, default=0)
