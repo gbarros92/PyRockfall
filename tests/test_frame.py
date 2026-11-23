@@ -274,6 +274,43 @@ def test_model_uses_normals_to_ignore_the_floor():
     assert f.length == pytest.approx(2 * LEG, rel=0.08)
 
 
+def wide_wall(leg=60.0, height=50.0, dip=50.0, n=20000, seed=0):
+    """Laid-back version of :func:`l_wall`: 50 m high at 50 degrees, so the face is
+    ~42 m wide in plan, as wide as the legs are long. Normals are exact; every
+    face point passes the steep mask (|nz| = cos(dip) = 0.64 < 0.7)."""
+    rng = np.random.default_rng(seed)
+    truth = CurvilinearFrame([[0.0, 0.0], [leg, 0.0], [leg, leg]])
+    s = rng.uniform(0.0, 2 * leg, n)
+    e = rng.uniform(0.0, height, n)
+    d = -(e - 0.5 * height) / np.tan(np.radians(dip)) + 0.05 * rng.standard_normal(n)
+    xyz = truth.sde_to_xyz(np.column_stack([s, d, e]))
+    normals = np.tile([np.sin(np.radians(dip)), 0.0, np.cos(np.radians(dip))], (n, 1))
+    return xyz, normals
+
+
+def test_model_normals_on_a_laid_back_wall_match_the_fit_without():
+    # Regression: the steep mask kept the whole face, a strip wider than the corner
+    # can take, and the fit zigzagged (39 segments, every point ambiguous).
+    xyz, normals = wide_wall()
+    plain = pr.PointCloud(points=xyz).fitFrame(corner_length=None)
+    f = pr.PointCloud(points=xyz, normals=normals).fitFrame(corner_length=None)
+    assert plain.n_segments == f.n_segments == 2
+    assert f.length == pytest.approx(120.0, rel=0.05)
+    assert np.degrees(f.turning_angles()[0]) == pytest.approx(90.0, abs=3.0)
+    info = f.diagnostics(xyz)
+    assert info["n_nan"] == 0 and info["n_ambiguous"] == 0 and info["n_past_fold"] == 0
+
+
+def test_fit_polyline_refits_do_not_diverge_on_a_wide_strip():
+    # Re-binning along the previous polyline must not make a too-wide strip worse.
+    xyz, _ = wide_wall()
+    V0, _ = fit_polyline(xyz[:, 0], xyz[:, 1], tol=1.0, res=0.5, n_iter=0)
+    V, _ = fit_polyline(xyz[:, 0], xyz[:, 1], tol=1.0, res=0.5, n_iter=2)
+    assert len(V) <= len(V0)
+    folded = lambda P: sum(CurvilinearFrame(P).xyz_to_sde(xyz, return_info=True)[1:])
+    assert folded(V) <= folded(V0)
+
+
 def test_frame_is_invalidated_by_moves_and_kept_by_subsets():
     xyz, _, _ = l_wall(n=3000)
     pc = pr.PointCloud(points=xyz.copy())
