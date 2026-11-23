@@ -233,3 +233,7 @@ __marimo__/
 
 # 3D Models
 *.ply
+
+# JSON outputs (frames, run summaries); keep the package style file
+*.json
+!src/pyrockfall/scripts/mplstyle.json

@@ -652,9 +652,9 @@ def main() -> None:
     ap.add_argument("--veg-ids", type=float, nargs="+", default=[0.0],
                     help="Material IDs of the vegetation. Default: 0")
     ap.add_argument("--frame", type=Path, help="Frame JSON to use instead of fitting one.")
-    ap.add_argument("--frame-normals", action="store_true",
-                    help="Let the frame fit use the point normals (to pick the steep points). On susan.ply "
-                         "they give a wrong frame, so they are not used by default.")
+    ap.add_argument("--frame-normals", action=argparse.BooleanOptionalAction, default=True,
+                    help="Let the frame fit use the point normals, when the cloud has them, to pick the "
+                         "steep points. Default: on (--no-frame-normals to fit on xyz only).")
     ap.add_argument("--voxel", type=float, help="Thin the cloud to one point per voxel of this size before filling.")
     ap.add_argument("--refill", action="store_true", help="Fill again even if <out>/filled.ply exists.")
     ap.add_argument("--no-cover", action="store_true", help="Do not keep the filled rock behind the vegetation.")
