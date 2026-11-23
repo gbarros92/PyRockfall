@@ -805,3 +805,64 @@ def test_slope_features_roughness_is_nonzero_for_irregular_profile():
     slope = pr.Slope(geometry, materials=mat)
     height, slope_angle, roughness = slopeFeatures(slope)
     assert roughness > 0.0
+
+
+def _recess_behind_vegetation(seed=0, depth=0.8, radius=4.0, rough=0.15):
+    """Wall dipping 60 deg with a recess hidden by vegetation 0.1-0.5 m in front of
+    it (Material 0). Returns the cloud, its frame, the outward sign, the true
+    height of the rock as a function of (u, v) and the vegetation in (u, v, w)."""
+    from scipy.spatial import cKDTree
+    from pyrockfall._kriging import RandomField, Variogram
+    rng = np.random.default_rng(seed)
+    truth = pr.CurvilinearFrame([[0.0, 0.0], [40.0, 0.0]])
+    n = 15000
+    s, e = rng.uniform(0, 40, n), rng.uniform(0, 15, n)
+    sde = np.column_stack([s, -(e - 7.5) / np.tan(np.radians(60.0)), e])
+    plain = pr.PointCloud(points=truth.sde_to_xyz(sde))
+    F = plain.fitFrame()
+    uvw = plain.uvw()
+    side = F.outward_sign()
+    c = np.median(uvw[:, :2], axis=0)
+    bump = np.clip(1 - (np.hypot(*(uvw[:, :2] - c).T) / radius) ** 2, 0, None)
+    uvw[:, 2] += RandomField(uvw[:, :2], Variogram("spherical", psill=rough ** 2, range=2.0),
+                             resolution=0.2).sample(rng, 1)[0] - side * depth * bump
+    hole = np.hypot(*(uvw[:, :2] - c).T) < radius
+    vuv = c + rng.uniform(-radius, radius, (5000, 2))
+    vuv = vuv[np.hypot(*(vuv - c).T) < radius]
+    tree = cKDTree(uvw[:, :2])
+    veg = np.column_stack([vuv, uvw[tree.query(vuv)[1], 2] + side * rng.uniform(0.1, 0.5, len(vuv))])
+    pc = pr.PointCloud(points=F.uvw_to_xyz(np.vstack([uvw[~hole], veg])))
+    pc.set_attr("Material", np.r_[np.where(uvw[~hole, 1] > 0, 2.0, 1.0), np.zeros(len(veg))])
+    pc.frame = F
+    return pc, F, side, (lambda uv: uvw[tree.query(uv)[1], 2]), veg
+
+
+def test_fill_and_realisations_stay_behind_the_cover():
+    from scipy.spatial import cKDTree
+    results = {}
+    for cover in (None, "removed"):
+        pc, F, side, truth_w, veg = _recess_behind_vegetation()
+        pc.removePoints("Material", 0)
+        filled, info = pc.fillHoles(attributes=["Material"], cover=cover, return_info=True)
+        new = filled.get_attr("filled") == 1
+        p = filled.uvw()[new]
+        _, i = cKDTree(p[:, :2]).query(veg[:, :2])
+        behind = np.mean(side * veg[:, 2] < side * p[i, 2] - 0.02)
+        rmse = np.sqrt(np.mean((p[:, 2] - truth_w(p[:, :2])) ** 2))
+        results[cover] = (behind, rmse)
+        if cover is None:
+            assert not filled.has_attr("cover_bound") and info["cover_side"] is None
+            continue
+        assert info["cover_side"] == side
+        reals = pr.sampleRealisations(filled, 100, "Material", info=info, uncertain_only=True, seed=1)
+        W = np.stack([F.xyz_to_uvw(r.points)[:, 2] for r in reals])
+        sig = np.asarray(filled.get_attr("kriging_std"))[new]
+        B = np.asarray(filled.get_attr("cover_bound"))[new]
+        hb = np.isfinite(B)
+        assert hb.mean() > 0.8
+        assert not np.any(side * W[:, hb] > side * B[hb] + 1e-6)          # every realisation behind the cover
+        assert np.mean(np.abs(W.mean(axis=0) - p[:, 2])) < 0.03            # averages to the stored height
+        big = sig > 0.02
+        assert 0.85 < np.median(W.std(axis=0)[big] / sig[big]) < 1.15      # and spreads as kriging_std
+    assert results[None][0] > 0.4 and results["removed"][0] == 0.0
+    assert results["removed"][1] < 0.4 * results[None][1]

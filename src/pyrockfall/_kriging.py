@@ -19,6 +19,9 @@ of a :class:`~._frame.CurvilinearFrame`.
 - :class:`GaussianField`, :class:`RandomField` and
   :func:`conditional_simulation` draw spatially correlated realisations that
   reproduce a variogram and honour the data.
+- :func:`kriging_conditional` and :func:`truncated_gaussian_gibbs` handle
+  inequality data: the surface must lie behind points that cover it (e.g.
+  vegetation), so its values at those points follow a truncated Gaussian.
 """
 from __future__ import annotations
 
@@ -27,11 +30,12 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from scipy import ndimage
-from scipy.linalg import lu_factor, lu_solve
+from scipy.linalg import LinAlgError, cho_factor, cho_solve, lu_factor, lu_solve
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from scipy.fft import next_fast_len
 from scipy.spatial.distance import cdist, pdist
+from scipy.special import log_ndtr, ndtri_exp, ndtr
 
 __all__ = [
     "VARIOGRAM_MODELS",
@@ -48,6 +52,8 @@ __all__ = [
     "GaussianField",
     "RandomField",
     "conditional_simulation",
+    "kriging_conditional",
+    "truncated_gaussian_gibbs",
 ]
 
 VARIOGRAM_MODELS = ("spherical", "exponential", "gaussian", "linear")
@@ -581,6 +587,199 @@ def ordinary_kriging(
     return (est[:, 0] if one_d else est), var
 
 
+def kriging_conditional(xy, values, xy_new, variogram: AnyVariogram) -> Tuple[np.ndarray, np.ndarray]:
+    """Ordinary kriging estimate at `xy_new` and the full covariance of its errors.
+
+    The errors ``Z(x_i) - z_ok(x_i)`` of ordinary kriging are jointly Gaussian
+    with covariance (written with the variogram, so it holds for unbounded
+    models too)::
+
+        S = -G_nn + L' G_dn + G_dn' L - L' G_dd L
+
+    where ``L`` holds the kriging weights. Its diagonal is the kriging variance.
+    Together with the estimate, it is the distribution of the field at `xy_new`
+    given the data (the "simple" part of a conditional simulation), which
+    :func:`truncated_gaussian_gibbs` samples under inequality constraints.
+
+    Parameters
+    ----------
+    xy : (n, 2) array
+        Data locations (exact duplicates are merged, keeping the first).
+    values : (n,) array
+    xy_new : (m, 2) array
+    variogram : Variogram or NestedVariogram
+
+    Returns
+    -------
+    estimate : (m,) array
+    covariance : (m, m) array
+    """
+    X = variogram.transform(np.asarray(xy, dtype=float))
+    C = variogram.transform(np.asarray(xy_new, dtype=float))
+    vals = np.asarray(values, dtype=float).ravel()
+    if X.shape[0] != vals.shape[0]:
+        raise ValueError("xy and values must have the same number of rows.")
+    if X.shape[0] == 0:
+        raise ValueError("kriging_conditional() needs at least one data point.")
+    _, first = np.unique(X, axis=0, return_index=True)
+    if first.size < X.shape[0]:
+        first.sort()
+        X, vals = X[first], vals[first]
+    n, m = X.shape[0], C.shape[0]
+    if m == 0:
+        return np.empty(0), np.empty((0, 0))
+    G_dd = variogram.gamma(cdist(X, X))
+    A = np.empty((n + 1, n + 1))
+    A[:n, :n] = G_dd
+    A[:n, n] = 1.0
+    A[n, :n] = 1.0
+    A[n, n] = 0.0
+    G_dn = variogram.gamma(cdist(X, C))
+    W = lu_solve(lu_factor(A, check_finite=False), np.vstack([G_dn, np.ones((1, m))]), check_finite=False)
+    L = W[:n]
+    S = -variogram.gamma(cdist(C, C)) + L.T @ G_dn + G_dn.T @ L - L.T @ (G_dd @ L)
+    S = 0.5 * (S + S.T)
+    return L.T @ vals, S
+
+
+def truncated_gaussian_gibbs(
+    mean,
+    cov,
+    upper,
+    k: int,
+    *,
+    rng: Optional[np.random.Generator] = None,
+    sweeps: int = 50,
+    init=None,
+) -> np.ndarray:
+    """Draws of ``y ~ N(mean, cov)`` restricted to ``y <= upper`` (componentwise).
+
+    Gibbs sampler: each component in turn is drawn from its Gaussian
+    conditional on the others, truncated at its bound (inverse CDF in log
+    space, so bounds far in the tail are safe). `k` chains run side by side
+    from a feasible start (``min(mean, upper)``, or `init`) and the state after
+    `sweeps` sweeps is returned; the chains are independent, so these are `k`
+    independent draws once the sweeps have mixed.
+
+    For a lower bound ``y >= lower`` sample ``-y`` with ``-mean`` and ``-lower``.
+
+    Parameters
+    ----------
+    mean : (n,) array
+    cov : (n, n) array
+        Covariance. A small relative jitter is added to its diagonal, raised
+        step by step (1e-10 to 1e-3 of the mean variance) until it factorises,
+        so nearly coincident points do not break it.
+    upper : (n,) array
+        Upper bounds (``+inf`` for none).
+    k : int
+        Number of draws.
+    rng : numpy.random.Generator, optional
+    sweeps : int
+        Sweeps through all components.
+    init : (k, n) array, optional
+        Feasible starting states.
+
+    Returns
+    -------
+    (k, n) array
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    mean = np.asarray(mean, dtype=float).ravel()
+    upper = np.asarray(upper, dtype=float).ravel()
+    n = mean.size
+    if upper.size != n or np.shape(cov) != (n, n):
+        raise ValueError("mean, cov and upper must have shapes (n,), (n, n) and (n,).")
+    if n == 0:
+        return np.empty((k, 0))
+    cov = np.asarray(cov, dtype=float)
+    scale = max(float(np.mean(np.diag(cov))), 1e-300)
+    for rel in (1e-10, 1e-8, 1e-6, 1e-5, 1e-4, 1e-3):
+        try:
+            factor = cho_factor(cov + rel * scale * np.eye(n), lower=True, check_finite=False)
+            break
+        except LinAlgError:
+            continue
+    else:
+        raise ValueError("cov must be positive (semi-)definite.")
+    Q = cho_solve(factor, np.eye(n), check_finite=False)
+    Q = 0.5 * (Q + Q.T)
+    qd = np.diag(Q).copy()
+    sd = 1.0 / np.sqrt(qd)
+
+    if init is None:
+        y = np.repeat(np.minimum(mean, upper)[:, None], k, axis=1)
+    else:
+        y = np.array(init, dtype=float).T.copy()
+        if y.shape != (n, k):
+            raise ValueError(f"init must have shape (k={k}, n={n}).")
+        if np.any(y > upper[:, None]):
+            raise ValueError("init must satisfy the bounds.")
+    e = y - mean[:, None]
+    Qe = Q @ e
+    for _ in range(int(sweeps)):
+        for i in range(n):
+            cm = mean[i] - (Qe[i] - qd[i] * e[i]) / qd[i]        # conditional mean of y_i
+            beta = (upper[i] - cm) / sd[i]
+            logp = log_ndtr(beta) + np.log1p(-rng.random(k))     # uniform in (0, Phi(beta)]
+            new = np.minimum(cm + sd[i] * ndtri_exp(logp), upper[i])
+            d = new - y[i]
+            y[i] = new
+            e[i] += d
+            Qe += np.outer(Q[:, i], d)
+    return y.T
+
+
+def _most_binding(uv, bound, max_n: int, cell: float) -> np.ndarray:
+    """Indices of at most `max_n` points: the one with the lowest `bound` in each
+    cell of a square grid, coarsened until there are few enough."""
+    uv = np.asarray(uv, dtype=float)
+    if uv.shape[0] == 0:
+        return np.empty(0, dtype=np.int64)
+    lo = uv.min(axis=0)
+    g = max(float(cell), 1e-9)
+    for _ in range(40):
+        c = np.floor((uv - lo) / g).astype(np.int64)
+        key = c[:, 0] * (c[:, 1].max() + 1) + c[:, 1]
+        order = np.lexsort((bound, key))                       # by cell, then lowest bound first
+        _, first = np.unique(key[order], return_index=True)
+        pick = order[first]
+        if pick.size <= max_n:
+            break
+        g *= 1.05 * np.sqrt(pick.size / max_n)
+    return np.sort(pick)
+
+
+def censored_moments(mean, std, upper) -> Tuple[np.ndarray, np.ndarray]:
+    """Mean and variance of ``min(X, upper)`` for ``X`` a mixture of Gaussians.
+
+    Parameters
+    ----------
+    mean : (m,) or (m, K) array
+        Means of the ``K`` equally weighted components of each ``X``.
+    std : (m,) array
+        Their common standard deviation.
+    upper : (m,) array
+        Upper bounds.
+
+    Returns
+    -------
+    mean, variance : (m,) arrays
+    """
+    mu = np.asarray(mean, dtype=float)
+    mu = mu[:, None] if mu.ndim == 1 else mu
+    sd = np.asarray(std, dtype=float)[:, None]
+    b = np.asarray(upper, dtype=float)[:, None]
+    safe = np.where(sd > 0, sd, 1.0)
+    a = (b - mu) / safe
+    P = np.where(sd > 0, ndtr(a), (mu <= b).astype(float))
+    phi = np.where(sd > 0, np.exp(-0.5 * a ** 2) / np.sqrt(2.0 * np.pi), 0.0)
+    e1 = mu * P - sd * phi + b * (1.0 - P)
+    e2 = (mu ** 2 + sd ** 2) * P - sd * (mu + b) * phi + b ** 2 * (1.0 - P)
+    m1 = e1.mean(axis=1)
+    return m1, np.maximum(e2.mean(axis=1) - m1 ** 2, 0.0)
+
+
 def poly_design(uv, order: int, center, scale: float) -> np.ndarray:
     """Design matrix of a 2D polynomial of total degree <= `order`, on coordinates
     normalised as ``(uv - center) / scale``."""
@@ -710,6 +909,12 @@ def fill_holes_uv(
     dense_lag: float = 3.0,
     surface_tol: Optional[float] = 0.15,
     surface_radius: Optional[float] = None,
+    cover_uvw=None,
+    cover_side: float = 1.0,
+    cover_margin: float = 0.0,
+    max_cover: int = 500,
+    cover_samples: int = 200,
+    cover_sweeps: int = 50,
     seed: int = 0,
 ) -> dict:
     """Create points in the holes of a point set and krige their height and attributes.
@@ -766,6 +971,28 @@ def fill_holes_uv(
         nearest neighbours (within `surface_radius`, if given; see
         :func:`surface_mask`) are left out of the height trend, variogram and
         kriging. ``surface_tol=None`` keeps every point.
+    cover_uvw : (r, 3) array, optional
+        Points that lie in front of the surface (e.g. vegetation that hid it).
+        The surface must be behind each of them: ``cover_side * w`` at most
+        ``cover_side * w_cover - cover_margin`` there. In each cell of a grid
+        (about `max_cover` cells per hole, coarsest where needed) the deepest
+        cover point is a bound; bounds the unconstrained kriging is unlikely to
+        reach (3 std away) are dropped. The height at the bounds is drawn from
+        its truncated Gaussian (:func:`truncated_gaussian_gibbs`,
+        `cover_samples` draws, `cover_sweeps` sweeps), and the new points are
+        kriged from the ring plus each draw: their height is the mean of those
+        estimates and its variance the kriging variance plus their variance
+        (law of total variance). Then every new point with cover points within
+        one spacing is kept behind the deepest of them: its height is the mean
+        of the censored distribution ``min(X, bound)`` and `std` its standard
+        deviation (``cover_bound`` and ``free_w`` in the result let realisations
+        be clipped the same way).
+    cover_side : {1, -1}
+        Direction of "in front" along ``w``: +1 if the cover lies at larger ``w``.
+    cover_margin : float
+        Least distance of the surface behind the cover.
+    max_cover, cover_samples, cover_sweeps : int
+        See `cover_uvw`.
 
     Returns
     -------
@@ -777,8 +1004,23 @@ def fill_holes_uv(
     diagnostics per hole, including ``w_variogram`` and ``train_idx``, the
     indices of the points the height was kriged from, which
     :func:`conditional_simulation` needs to draw realisations consistent with
-    the kriging).
+    the kriging; ``trend`` (order, center, scale, coef of the trend of ``w``);
+    with `cover_uvw`, ``cover``: the bounds used, ``uv`` (b, 2), ``bound_w``
+    (b,) the highest allowed ``cover_side * w`` times `cover_side`, i.e. the
+    bound on ``w`` itself, ``side``, and ``mean`` (b,) the mean of the drawn
+    residuals, plus ``n_cover_points``, ``n_cover_active`` and ``n_cover_clipped``);
+    ``cover_bound`` (m,) the bound on ``w`` of each new point (NaN without
+    cover), ``free_w`` (m,) its height before the bound (the mean of ``X``;
+    NaN without cover) and ``cover_side``.
     """
+    if cover_side not in (1, -1, 1.0, -1.0):
+        raise ValueError("cover_side must be 1 or -1.")
+    cover = None
+    if cover_uvw is not None:
+        cover = np.asarray(cover_uvw, dtype=float).reshape(-1, 3)
+        cover = cover[np.isfinite(cover).all(axis=1)]
+        if cover.shape[0] == 0:
+            cover = None
     uvw = np.asarray(uvw, dtype=float)
     uv, w = uvw[:, :2], uvw[:, 2]
     attrs = {} if attrs is None else attrs
@@ -807,13 +1049,22 @@ def fill_holes_uv(
         else:
             raise ValueError("kind must be 'categorical' or 'continuous'.")
 
-    out_uvw, out_std, out_hole, out_near = [], [], [], []
+    out_uvw, out_std, out_hole, out_near, out_bound, out_free = [], [], [], [], [], []
     out_attr = {name: dict(value=[], std=[], probs=[]) for name in spec}
     holes_info: List[dict] = []
 
     flat = np.floor((uv - origin) / cell).astype(np.int64)
     flat = flat[:, 0] * shape[1] + flat[:, 1]
     boxes = ndimage.find_objects(labels)
+
+    # Cover points sorted by grid cell, so each hole finds its own quickly
+    if cover is not None:
+        cij = np.floor((cover[:, :2] - origin) / cell).astype(np.int64)
+        on_grid = (cij[:, 0] >= 0) & (cij[:, 0] < shape[0]) & (cij[:, 1] >= 0) & (cij[:, 1] < shape[1])
+        cover_idx = np.flatnonzero(on_grid)
+        cover_flat = cij[on_grid, 0] * shape[1] + cij[on_grid, 1]
+        srt = np.argsort(cover_flat, kind="stable")
+        cover_idx, cover_flat = cover_idx[srt], cover_flat[srt]
 
     for h in range(1, n_holes + 1):
         box = boxes[h - 1]
@@ -893,13 +1144,72 @@ def fill_holes_uv(
         else:
             vg = fit_variogram(ug, resid, variogram, nlags=nlags, aniso=w_aniso, angle=angle, seed=seed)
         r_new, var = ordinary_kriging(ug, resid, tgt, vg, n_closest=n_closest)
-        w_new = poly_design(tgt, order, center, scale) @ coef + r_new
-        std = np.sqrt(var)
+        r_free = r_new
+        r_draws, var_ok = r_new[:, None], var                       # estimate per draw at the bounds
+        bound_t = np.full(m, np.nan)
+        free_t = np.full(m, np.nan)
         info.update(n_train=int(idx_g.size), ring=float(ring_g), w_variogram=vg.to_dict(),
-                    w_residual_std=float(resid.std()), train_idx=idx_g)
+                    w_residual_std=float(resid.std()), train_idx=idx_g,
+                    trend=dict(order=order, center=center.tolist(), scale=scale, coef=coef.tolist()))
+
+        # ---- cover: the surface lies behind the points in front of it
+        if cover is not None:
+            gi, gj = np.nonzero(grow)
+            cells = (gi + i0) * shape[1] + (gj + j0)
+            lo_c = np.searchsorted(cover_flat, cells, side="left")
+            hi_c = np.searchsorted(cover_flat, cells, side="right")
+            in_win = np.concatenate([cover_idx[a:b] for a, b in zip(lo_c, hi_c) if b > a] or [np.empty(0, np.int64)])
+            cu, cw = cover[in_win, :2], cover[in_win, 2]
+            info["n_cover_points"] = int(cu.shape[0])
+            info["n_cover_active"] = 0
+            if cu.shape[0] > 0:
+                c_trend = poly_design(cu, order, center, scale) @ coef
+                b = cover_side * (cw - c_trend) - cover_margin            # cover_side * residual <= b
+                pick = _most_binding(cu, b, max_cover, sp)
+                cu, b, c_trend = cu[pick], b[pick], c_trend[pick]
+                mu_c, S_c = kriging_conditional(ug, resid, cu, vg)
+                sd_c = np.sqrt(np.clip(np.diag(S_c), 0.0, None))
+                live = (b - cover_side * mu_c) < 3.0 * sd_c                # can be reached
+                info["n_cover_active"] = int(live.sum())
+                if live.any():
+                    cu, b, c_trend = cu[live], b[live], c_trend[live]
+                    mu_c, S_c = mu_c[live], S_c[np.ix_(live, live)]
+                    Y = cover_side * truncated_gaussian_gibbs(cover_side * mu_c, S_c, b, cover_samples,
+                                                              rng=rng, sweeps=cover_sweeps)      # (K, b)
+                    vals = np.vstack([np.repeat(resid[:, None], cover_samples, axis=1), Y.T])
+                    est_k, var_ok = ordinary_kriging(np.vstack([ug, cu]), vals, tgt, vg, n_closest=n_closest)
+                    r_draws = est_k
+                    r_new = est_k.mean(axis=1)
+                    var = var_ok + est_k.var(axis=1)
+                    info["cover"] = dict(uv=cu, bound_w=c_trend + cover_side * b, side=float(cover_side),
+                                         margin=float(cover_margin), mean=Y.mean(axis=0))
+                    info["cover_shift"] = float(np.median(np.abs(r_new - r_free)))
+
+        t_trend = poly_design(tgt, order, center, scale) @ coef
+        w_new = t_trend + r_new
+        std = np.sqrt(var)
+
+        # ---- cover, locally: each new point stays behind the deepest cover point near it
+        if cover is not None and info.get("n_cover_points", 0) > 0:
+            cu_all, cw_all = cover[in_win, :2], cover[in_win, 2]
+            dt, it = cKDTree(tgt).query(cu_all, k=1, distance_upper_bound=sp)
+            near = np.isfinite(dt)
+            sb = np.full(m, np.inf)                                 # bound on cover_side * w
+            np.minimum.at(sb, it[near], cover_side * cw_all[near] - cover_margin)
+            has = np.isfinite(sb)
+            if has.any():
+                mu_s = cover_side * (t_trend[has, None] + r_draws[has])
+                mean_s, var_s = censored_moments(mu_s, np.sqrt(var_ok[has]), sb[has])
+                free_t[has] = w_new[has]
+                bound_t[has] = cover_side * sb[has]
+                w_new[has] = cover_side * mean_s
+                std[has] = np.sqrt(var_s)
+            info["n_cover_clipped"] = int(has.sum())
 
         out_uvw.append(np.column_stack([tgt, w_new]))
         out_std.append(std)
+        out_bound.append(bound_t)
+        out_free.append(free_t)
         out_hole.append(np.full(m, h, dtype=np.int64))
         out_near.append(nearest)
 
@@ -974,6 +1284,9 @@ def fill_holes_uv(
     return dict(
         uvw=cat(out_uvw, np.empty((0, 3))),
         std=cat(out_std, np.empty(0)),
+        cover_bound=cat(out_bound, np.empty(0)),
+        free_w=cat(out_free, np.empty(0)),
+        cover_side=float(cover_side) if cover is not None else None,
         hole=cat(out_hole, np.empty(0, dtype=np.int64)),
         nearest=cat(out_near, np.empty(0, dtype=np.int64)),
         attrs=result_attrs,
@@ -1156,8 +1469,9 @@ def conditional_simulation(
     ----------
     xy : (n, 2) array
         Data locations.
-    values : (n,) array
-        Data values.
+    values : (n,) or (n, k) array
+        Data values, or one column of values per realisation (e.g. values at
+        inequality points drawn by :func:`truncated_gaussian_gibbs`).
     xy_new : (m, 2) array
         Locations to simulate.
     variogram : Variogram or NestedVariogram
@@ -1175,19 +1489,26 @@ def conditional_simulation(
     Returns
     -------
     realisations : (k, m) array
-    estimate : (m,) array
-        Kriging estimate ``z_ok``.
+    estimate : (m,) or (m, k) array
+        Kriging estimate ``z_ok`` (one column per realisation if `values` has
+        one).
     variance : (m,) array
         Kriging variance.
     """
     rng = np.random.default_rng() if rng is None else rng
     xy = np.asarray(xy, dtype=float)
     xy_new = np.asarray(xy_new, dtype=float)
-    values = np.asarray(values, dtype=float).ravel()
+    values = np.asarray(values, dtype=float)
+    if values.ndim == 2 and values.shape[1] == 1:
+        values = values[:, 0]
+    if values.ndim == 2 and values.shape[1] != k:
+        raise ValueError(f"values must have shape (n,) or (n, k={k}); got {values.shape}.")
+    values = values.reshape(values.shape[0], -1)              # (n, 1) or (n, k)
     n, m = xy.shape[0], xy_new.shape[0]
     if m == 0:
-        return np.empty((k, 0)), np.empty(0), np.empty(0)
+        return np.empty((k, 0)), np.empty((0,) if values.shape[1] == 1 else (0, k)), np.empty(0)
+    c = values.shape[1]
     sim = RandomField(np.vstack([xy, xy_new]), variogram, resolution=resolution, max_cells=max_cells).sample(rng, k)
     est, var = ordinary_kriging(xy, np.column_stack([values, sim[:, :n].T]), xy_new, variogram, n_closest=n_closest)
-    real = est[:, :1].T + sim[:, n:] - est[:, 1:].T
-    return real, est[:, 0], var
+    real = est[:, :c].T + sim[:, n:] - est[:, c:].T
+    return real, (est[:, 0] if c == 1 else est[:, :c]), var

@@ -24,7 +24,7 @@ try:  # optional dependency, used only for non-.npz formats
 except Exception:  # pragma: no cover
     _HAS_O3D = False
 
-from ._model import Model
+from ._model import Model, _slice_positions
 from ._geometry import Geometry
 from ._geometry3d import Geometry3D
 from ._frame import CurvilinearFrame
@@ -735,6 +735,7 @@ class Mesh(Model):
         label: Optional[str] = None,
         *,
         frame: Optional[CurvilinearFrame] = None,
+        positions: Optional[NDArray[np.floating]] = None,
         **kwargs,
     ) -> Tuple[List[Geometry], NDArray]:
         """
@@ -756,6 +757,10 @@ class Mesh(Model):
             label: Name of the attribute containing material IDs (per point or
                 per triangle).
             frame: Frame to slice in. Defaults to the frame of the mesh.
+            positions: Slice positions to use instead of a grid every
+                ``increment`` (see :meth:`PointCloud.slice`). Positions that cut
+                no triangle are skipped, so match the returned positions
+                against these.
 
         Returns:
             Profiles as :class:`Geometry` objects and the slice positions (``s``,
@@ -799,7 +804,10 @@ class Mesh(Model):
         x_min, x_max = float(np.nanmin(V[:, 0])), float(np.nanmax(V[:, 0]))
         if not np.isfinite(x_max - x_min) or x_max <= x_min:
             return [], np.array([], dtype=float)
-        x_positions = np.arange(x_min + increment/2.0, x_max, increment, dtype=float)
+        if positions is None:
+            x_positions = np.arange(x_min + increment/2.0, x_max, increment, dtype=float)
+        else:
+            x_positions = _slice_positions(positions)
 
         # --- neighbors (edge-based: edge i is v[i] -> v[(i+1)%3])
         neighbours = build_neighbours_mesh(T)
@@ -832,6 +840,12 @@ class Mesh(Model):
             cand = cand[x_max[cand] >= x_positions[i]]
             if cand.size:
                 init_idx[i] = cand[np.argmax(z_c[cand])]
+        if positions is not None:
+            # Explicit positions may fall outside the mesh: skip those
+            hit = init_idx >= 0
+            x_positions, init_idx = x_positions[hit], init_idx[hit]
+            if x_positions.size == 0:
+                return [], np.array([], dtype=float)
         nodes = []
         elements = []
         current_idx = np.array(init_idx, copy=True)

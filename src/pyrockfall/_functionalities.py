@@ -403,6 +403,7 @@ def sampleRealisations(
     surface_radius: Optional[float] = None,
     resolution: Optional[float] = None,
     uncertain_only: bool = False,
+    cover_sweeps: int = 50,
     seed: int = 0,
 ) -> List[PointCloud]:
     """
@@ -429,6 +430,15 @@ def sampleRealisations(
 
     Points with ``std == 0`` and a probability of 1 for one class are certain and
     are copied unchanged.
+
+    If the holes were filled with a cover (``fillHoles(..., cover=...)``, and
+    `info` is given), each realisation first draws the height at the cover
+    bounds from its truncated Gaussian (:func:`~._kriging.truncated_gaussian_gibbs`),
+    so it lies behind the cover there, and the kriging error is simulated
+    conditionally on those heights as well as on the existing points. Points
+    with a bound of their own (attribute ``"cover_bound"``) are then clipped at
+    it, so the realisations average to the stored height and spread as
+    ``kriging_std``.
 
     The variograms and conditioning points are set per hole (attribute
     ``"hole_id"``; one group if it is missing):
@@ -479,6 +489,8 @@ def sampleRealisations(
         shortest distances).
     uncertain_only : bool
         Return only the uncertain points of each realisation.
+    cover_sweeps : int
+        Gibbs sweeps for the heights at the cover bounds.
     seed : int
         Random seed.
 
@@ -496,7 +508,8 @@ def sampleRealisations(
         If attributes are missing or the probabilities are not valid.
     """
     from ._kriging import (Variogram, GaussianField, RandomField, conditional_simulation, fit_variogram,
-                           fit_nested_variogram, poly_design, surface_mask, variogram_from_dict, _thin)
+                           fit_nested_variogram, poly_design, surface_mask, variogram_from_dict, _thin,
+                           kriging_conditional, truncated_gaussian_gibbs)
     from scipy.spatial import cKDTree
     from scipy.special import ndtr
 
@@ -596,7 +609,23 @@ def sampleRealisations(
                 vc = Variogram(variogram, psill=1.0, range=max(0.25 * size, 1e-3), aniso=aniso, angle=angle)
 
         # ---- coordinates: kriging error drawn by conditional simulation
-        if train is not None:
+        cover = known.get("cover") if (known is not None and train is not None and "trend" in known) else None
+        if cover is not None and len(cover.get("uv", [])) > 0:
+            # Heights at the cover bounds: truncated Gaussian given the existing points
+            tr = known["trend"]
+            t_args = (int(tr["order"]), np.asarray(tr["center"], dtype=float), float(tr["scale"]))
+            t_coef = np.asarray(tr["coef"], dtype=float)
+            cu = np.asarray(cover["uv"], dtype=float).reshape(-1, 2)
+            side = float(cover["side"])
+            r_d = uvw[train, 2] - poly_design(uvw[train, :2], *t_args) @ t_coef
+            b = side * (np.asarray(cover["bound_w"], dtype=float) - poly_design(cu, *t_args) @ t_coef)
+            mu_c, S_c = kriging_conditional(uvw[train, :2], r_d, cu, vw)
+            Y = side * truncated_gaussian_gibbs(side * mu_c, S_c, b, n_realisations, rng=rng, sweeps=cover_sweeps)
+            # w_r - w = OK of (0 at the existing points, Y - mean at the bounds) + kriging error
+            vals = np.vstack([np.zeros((train.size, n_realisations)), (Y - np.asarray(cover["mean"], dtype=float)).T])
+            DW[:, sel], _, _ = conditional_simulation(np.vstack([uvw[train, :2], cu]), vals, uv_g, vw,
+                                                      n_realisations, rng=rng, resolution=res_g)
+        elif train is not None:
             DW[:, sel], _, _ = conditional_simulation(uvw[train, :2], np.zeros(train.size), uv_g, vw,
                                                       n_realisations, rng=rng, resolution=res_g)
         else:
@@ -607,6 +636,18 @@ def sampleRealisations(
         # ---- materials: probability field
         Q[:, sel] = ndtr(GaussianField(uv_g, vc).sample(rng, n_realisations)) if vc is not None \
             else rng.random((n_realisations, sel.size))
+
+    # ---- Cover: clip at the bound of each point, as fillHoles did for its mean
+    side = None if info is None else info.get("cover_side")
+    if side is not None and pc.has_attr("cover_bound") and pc.has_attr("cover_free_w") and n_unc:
+        B = np.asarray(pc.get_attr("cover_bound"), dtype=float)[idx]
+        F = np.asarray(pc.get_attr("cover_free_w"), dtype=float)[idx]
+        has = np.isfinite(B) & np.isfinite(F)
+        if has.any():
+            side = float(side)
+            X = F[has] + DW[:, has]                       # realisation before the bound
+            Y = side * np.minimum(side * X, side * B[has])
+            DW[:, has] = Y - uvw[idx[has], 2]             # relative to the stored (censored) mean
 
     # ---- Realisations
     keep = idx if uncertain_only else np.arange(N)

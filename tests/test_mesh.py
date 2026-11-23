@@ -653,3 +653,16 @@ def test_section_with_per_triangle_labels_and_no_sections():
         m.section(increment=4.5, label="missing")
     with pytest.raises(ValueError, match="needs >=3 points"):      # an empty mesh has no frame
         pr.Mesh().section(increment=1.0, label="mat")
+
+
+def test_slice_at_given_positions_skips_those_off_the_mesh():
+    pts = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 1.0, 1.0], [2.0, 1.0, 1.0]])
+    tris = np.array([[0, 1, 2], [1, 3, 2]])
+    m = pr.Mesh(points=pts, triangles=tris)
+    m.set_attr("mat", np.array([0, 1]))
+    profiles, xs = m.slice(np.array([1.0, 0.0, 0.0]), increment=0.5, label="mat", positions=[-1.0, 0.3, 1.6, 5.0])
+    np.testing.assert_allclose(xs, [0.3, 1.6])
+    for prof, x in zip(profiles, xs):
+        np.testing.assert_allclose(np.sort(prof.nodes[:, 0]), np.sort([0.0, 1.0 - x / 2.0, 1.0]), atol=1e-8)
+    empty, xe = m.slice(np.array([1.0, 0.0, 0.0]), increment=0.5, label="mat", positions=[9.0])
+    assert empty == [] and xe.size == 0

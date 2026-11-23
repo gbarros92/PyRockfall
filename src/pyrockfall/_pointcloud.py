@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Tuple, List, Mapping, Optional, Sequence, Dict
-from numpy.typing import NDArray
+from numpy.typing import NDArray, ArrayLike
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -16,7 +16,7 @@ except Exception:  # pragma: no cover
 
 ArrayF = NDArray[np.float64]
 
-from ._model import Model
+from ._model import Model, _slice_positions
 from ._geometry import Geometry
 from ._frame import CurvilinearFrame
 from ._kriging import fill_holes_uv, _class_label
@@ -273,6 +273,7 @@ class PointCloud(Model):
         outlier_radius: Optional[float] = None,
         method: str = "interp",
         refine: bool = True,
+        positions: Optional[ArrayLike] = None,
         **kwargs,
     ) -> Tuple[List["Geometry"], NDArray]:
         """
@@ -298,11 +299,19 @@ class PointCloud(Model):
             normal to that fixed direction instead; the profile coordinates are then
             the two remaining axes of the points rotated so that `direction` is +X.
         increment : float
-            Spacing between consecutive slices.
+            Spacing between consecutive slices, and thickness of each slab
+            (``+-increment/2`` around its centre).
         label : str
             Name of the point attribute holding material IDs.
         frame : CurvilinearFrame, optional
             Frame to slice in. Defaults to the frame of the point cloud.
+        positions : array-like, optional
+            Slice centres (``s``, or the distance along `direction`) to use instead
+            of a grid starting at the first point. Give the same positions, and the
+            same `frame`, to slice several models of one wall (e.g. the original
+            and a filled copy) at exactly the same places. `increment` is then only
+            the slab thickness. Positions with too few points are skipped, so match
+            the returned positions against these.
         method : {"interp", "walk"}
             How the profile is built from the points of a slab.
 
@@ -395,7 +404,10 @@ class PointCloud(Model):
 
         half = 0.5 * increment  # typical "+-inc/2" slab
 
-        x_positions = np.arange(x_min + half, x_max + 1e-12, increment, dtype=float)
+        if positions is None:
+            x_positions = np.arange(x_min + half, x_max + 1e-12, increment, dtype=float)
+        else:
+            x_positions = _slice_positions(positions)
         num_slices = x_positions.size
         if num_slices == 0:
             return [], np.array([], float)
@@ -530,6 +542,7 @@ class PointCloud(Model):
         slice_height_increment: float = 0.5,
         frame: Optional[CurvilinearFrame] = None,
         method: str = "interp",
+        positions: Optional[ArrayLike] = None,
     ):
         """
         Extract 2D profiles along the strike of the model.
@@ -558,6 +571,9 @@ class PointCloud(Model):
             How each profile is built from its points (see :meth:`slice`).
         frame : CurvilinearFrame, optional
             Frame to slice in. Defaults to the frame of the point cloud.
+        positions : array-like, optional
+            Positions ``s`` of the sections, instead of a grid every `increment`
+            (see :meth:`slice`).
         initial_direction, max_nodes, max_iter, tol, max_turn_angle, weight_power, min_new_fraction :
             Ignored. They controlled the polyline tracing that the curvilinear
             frame replaces and are kept for backward compatibility.
@@ -587,6 +603,7 @@ class PointCloud(Model):
             min_points=min_points,
             transverse_radius=transverse_radius,
             method=method,
+            positions=positions,
         )
 
     # ----------------------------
@@ -618,6 +635,12 @@ class PointCloud(Model):
         surface_tol: Optional[float] = 0.15,
         surface_radius: Optional[float] = None,
         others: str = "nearest",
+        cover=None,
+        cover_side="auto",
+        cover_margin: float = 0.0,
+        max_cover: int = 500,
+        cover_samples: int = 200,
+        cover_sweeps: int = 50,
         seed: int = 0,
         return_info: bool = False,
     ):
@@ -704,6 +727,25 @@ class PointCloud(Model):
         others : {"nearest", "nan"}
             Value given to the attributes that are not kriged: that of the nearest
             existing point, or NaN.
+        cover : "removed" or (r, 3) array, optional
+            Points that hid the surface and lie in front of it, e.g. vegetation:
+            ``"removed"`` uses the points taken out with :meth:`removePoints`, an
+            array gives their ``(x, y, z)``. The filled surface is kept behind them
+            (on the side away from the air, see
+            :meth:`CurvilinearFrame.outward_sign`): its height at the deepest
+            cover point of each small cell follows a truncated Gaussian, and the
+            mean and ``kriging_std`` of the new points account for it. See
+            ``cover_uvw`` in :func:`~._kriging.fill_holes_uv`.
+        cover_side : {"auto", 1, -1}
+            Which way along ``w`` is "in front" (towards the air). ``"auto"``:
+            from the frame when the face clearly dips (the outward direction has
+            an upward component, see :meth:`CurvilinearFrame.outward_sign`),
+            otherwise from the point normals (assumed to point to the air), and
+            an error if there are none.
+        cover_margin : float
+            Least distance (m) of the surface behind the cover.
+        max_cover, cover_samples, cover_sweeps : int
+            Bounds per hole, draws and Gibbs sweeps used for the cover.
         seed : int
             Random seed for thinning the rings.
         return_info : bool
@@ -714,7 +756,9 @@ class PointCloud(Model):
         PointCloud
             A new point cloud with the existing points followed by the new ones.
             Extra attributes: ``"filled"`` (1 for new points), ``"hole_id"``,
-            ``"kriging_std"`` (standard deviation of the kriged height); per
+            ``"kriging_std"`` (standard deviation of the kriged height); with
+            `cover`, ``"cover_bound"`` (the bound on ``w`` of each new point, NaN
+            where there is none) and ``"cover_free_w"`` (``w`` before it); per
             categorical attribute ``"<name>_P<class>"`` and ``"<name>_Pmax"``; per
             continuous attribute ``"<name>_std"``.
         dict
@@ -759,6 +803,16 @@ class PointCloud(Model):
 
         if cell is None:
             cell = 5.0 * self.resolution()
+        cover_uvw = None
+        if cover is not None:
+            if isinstance(cover, str):
+                if cover != "removed":
+                    raise ValueError("cover must be 'removed' or an (r, 3) array of points.")
+                cover_xyz = self._removed if self._removed is not None else np.empty((0, 3))
+            else:
+                cover_xyz = np.asarray(cover, dtype=float).reshape(-1, 3)
+            cover_uvw = frame.xyz_to_uvw(cover_xyz) if cover_xyz.shape[0] else None
+            side = self._cover_side(cover_side, uvw, ok)
         removed_uv = None
         if use_removed and self._removed is not None and self._removed.shape[0] > 0:
             removed_uv = frame.xyz_to_uvw(self._removed)[:, :2]
@@ -771,7 +825,9 @@ class PointCloud(Model):
             trend_order=trend_order, nlags=nlags, aniso=aniso,
             angle=frame.horizontal_angle_uv() + bedding_angle, w_aniso=geometry_aniso,
             shared_variogram=shared_variogram, dense_variogram=dense_variogram, dense_lag=dense_lag,
-            surface_tol=surface_tol, surface_radius=surface_radius, seed=seed,
+            surface_tol=surface_tol, surface_radius=surface_radius,
+            cover_uvw=cover_uvw, cover_side=side if cover_uvw is not None else 1.0, cover_margin=cover_margin,
+            max_cover=max_cover, cover_samples=cover_samples, cover_sweeps=cover_sweeps, seed=seed,
         )
         for h in res["holes"]:
             if "train_idx" in h:                    # indices into the output (existing points come first)
@@ -784,10 +840,13 @@ class PointCloud(Model):
         out.set_attr("filled", np.r_[np.zeros(n, dtype=np.int8), np.ones(m, dtype=np.int8)])
         out.set_attr("hole_id", np.r_[np.zeros(n, dtype=np.int32), res["hole"].astype(np.int32)])
         out.set_attr("kriging_std", np.r_[np.zeros(n), res["std"]].astype(np.float32))
+        if cover_uvw is not None:
+            out.set_attr("cover_bound", np.r_[np.full(n, np.nan), res["cover_bound"]])
+            out.set_attr("cover_free_w", np.r_[np.full(n, np.nan), res["free_w"]])
 
         nearest = idx_ok[res["nearest"]] if m else np.empty(0, dtype=np.int64)
         for name, arr in self.attrs.items():
-            if name in spec or name in ("filled", "hole_id", "kriging_std"):
+            if name in spec or name in ("filled", "hole_id", "kriging_std", "cover_bound", "cover_free_w"):
                 continue
             if others == "nearest":
                 out.set_attr(name, np.concatenate([arr, arr[nearest]], axis=0))
@@ -812,13 +871,34 @@ class PointCloud(Model):
 
         out._frame = frame
         if return_info:
-            info = dict(holes=res["holes"], n_new=int(m), spacing=res["spacing"], cell=res["cell"])
+            info = dict(holes=res["holes"], n_new=int(m), spacing=res["spacing"], cell=res["cell"],
+                        cover_side=res["cover_side"])
             return out, info
         return out
 
     # ----------------------------
     # Protected
     # ----------------------------
+    def _cover_side(self, cover_side, uvw, ok) -> float:
+        """+1 or -1: the direction of the air along ``w`` (see :meth:`fillHoles`)."""
+        if cover_side in (1, -1, 1.0, -1.0):
+            return float(cover_side)
+        if cover_side != "auto":
+            raise ValueError("cover_side must be 'auto', 1 or -1.")
+        frame = self.frame
+        if abs(frame.pca_axes[2, 2]) >= 0.2:                  # the face clearly dips
+            return frame.outward_sign()
+        if self.has_attr("normals"):
+            nrm = np.asarray(self.get_attr("normals"), dtype=float)
+            sub = np.flatnonzero(ok)[:: max(1, int(ok.sum()) // 20000)]
+            ahead = frame.xyz_to_uvw(self.points[sub] + 0.01 * nrm[sub])[:, 2]
+            dw = ahead - uvw[sub, 2]
+            dw = dw[np.isfinite(dw)]
+            if dw.size and np.median(dw) != 0:
+                return float(np.sign(np.median(dw)))
+        raise ValueError("The face is nearly vertical and there are no normals: give cover_side=1 or -1 "
+                         "(the direction of the air along w).")
+
     def _from_indices(self, ids: np.ndarray) -> "PointCloud":
         """Create a new PointCloud with a subset of rows, preserving attributes."""
         ids = np.asarray(ids, dtype=int)

@@ -13,7 +13,31 @@ class Geometry:
         elements: Optional[Union[Sequence[int], NDArray[np.integer]]] = None,
         attributes: Optional[Union[Sequence[int], NDArray[np.integer]]] = None,
         neighbours: Optional[NDArray[np.integer]] = None,
+        realisations: Optional[NDArray[np.floating]] = None,
     ):
+        """
+        Parameters
+        ----------
+        nodes : (N, D) float
+            Node coordinates (the mean geometry when it is uncertain).
+        nodes_std : (N, D) float, optional
+            Standard deviation of each coordinate. Without `realisations`, samples
+            perturb each coordinate independently with ``Normal(nodes, nodes_std)``.
+        elements : (E, M) int, optional
+            Connectivity. Defaults to a polyline through the nodes in order.
+        attributes : (E,) int, optional
+            Attribute of each element (e.g. material IDs).
+        neighbours : (E, D) int, optional
+            Element neighbours; computed on demand if omitted.
+        realisations : (R, N, D) float, optional
+            ``R`` complete versions of the geometry with the same nodes and
+            elements, e.g. profiles cut from realisations of a 3D model. Samples
+            are then drawn from these instead of from `nodes_std`: the geometry
+            has a single random variable, and a percentile ``q`` picks
+            realisation ``floor(q * R)``, so stratified percentiles (Latin
+            hypercube) use every realisation equally often. `nodes_std` is kept
+            for reference only.
+        """
         # --- store nodes internally as (D, N) ---
         nodes = np.asarray(nodes, dtype=float)
         if nodes.ndim != 2:
@@ -47,6 +71,20 @@ class Geometry:
             if arr.shape != nodes.shape:
                 raise ValueError("nodes_std must match nodes shape.")
             self._nodes_std = arr.T
+
+        # --- realisations (optional), stored as (R, D, N) ---
+        self._realisations: Optional[np.ndarray] = None
+        if realisations is not None:
+            reals = np.asarray(realisations, dtype=float)
+            if reals.ndim == 2:
+                reals = reals[None]
+            if reals.ndim != 3 or reals.shape[1:] != nodes.shape or reals.shape[0] < 1:
+                raise ValueError(
+                    f"realisations must have shape (R, N, D) with (N, D)={nodes.shape}; got {reals.shape}."
+                )
+            if not np.all(np.isfinite(reals)):
+                raise ValueError("realisations must be finite.")
+            self._realisations = np.ascontiguousarray(reals.transpose(0, 2, 1))
 
         # Neighbours: store if provided, else compute on demand
         self._neighbours: Optional[np.ndarray] = None
@@ -126,6 +164,8 @@ class Geometry:
 
     @property
     def hasUncertainty(self) -> bool:
+        if self._realisations is not None:
+            return True
         return np.any(self._nodes_std != 0.0).astype(bool)
 
     @property
@@ -134,8 +174,23 @@ class Geometry:
         return self._nodes_std.T
 
     @property
+    def realisations(self) -> np.ndarray | None:
+        """np.ndarray of shape (R, N, D), or None: Realisations of the geometry."""
+        if self._realisations is None:
+            return None
+        return self._realisations.transpose(0, 2, 1)
+
+    @property
+    def numRealisations(self) -> int:
+        """Number of realisations (zero if there are none)."""
+        return 0 if self._realisations is None else int(self._realisations.shape[0])
+
+    @property
     def numRandomVariables(self) -> int:
-        """Number of random variables (zero if no standard deviations)."""
+        """Number of random variables: one with realisations (which one to use),
+        otherwise one per uncertain coordinate (zero if no standard deviations)."""
+        if self._realisations is not None:
+            return 1
         if np.all(self._nodes_std == 0.0):
             return 0
         else:
@@ -143,15 +198,48 @@ class Geometry:
 
     @property
     def floor(self) -> float:
-        """Lowest vertical coordinate across all slope nodes."""
-        return float(np.min(self.nodes[:, -1]))
+        """Lowest vertical coordinate across all slope nodes (and realisations)."""
+        lowest = float(np.min(self.nodes[:, -1]))
+        if self._realisations is not None:
+            lowest = min(lowest, float(np.min(self._realisations[:, -1, :])))
+        return lowest
 
     # ------------------------------------------------------------------
     # Methods
     # ------------------------------------------------------------------
+    def realisationIndex(self, q) -> np.ndarray:
+        """
+        Realisation picked by each percentile.
+
+        Parameters
+        ----------
+        q : (S,) or (1, S) float
+            Percentiles in [0, 1].
+
+        Returns
+        -------
+        (S,) int
+            ``floor(q * R)``, clipped to ``[0, R - 1]``.
+        """
+        if self._realisations is None:
+            raise ValueError("This geometry has no realisations.")
+        q = np.asarray(q, dtype=float)
+        if q.ndim == 2 and q.shape[0] == 1:
+            q = q[0]
+        if q.ndim != 1:
+            raise ValueError("`q` must have shape (S,) or (1, S) for a geometry with realisations.")
+        R = self._realisations.shape[0]
+        return np.clip(np.floor(q * R).astype(np.int64), 0, R - 1)
+
+    def _from_realisations(self, idx: np.ndarray) -> np.ndarray:
+        """Nodes of realisations `idx`, as (N, D, S)."""
+        return np.ascontiguousarray(self._realisations[idx].transpose(2, 1, 0))
+
     def rvs(self, S: int = 1, *, random_state=None) -> np.ndarray:
         """
         Vectorised sampling of nodes.
+
+        With realisations, each sample is one of them, drawn uniformly.
 
         Inputs:
             self.nodes      : (D, M) float — mean coordinates
@@ -160,6 +248,10 @@ class Geometry:
         Returns:
             (D, M, 1) if all std == 0, else (D, M, S)
         """
+        if self._realisations is not None:
+            rng = np.random.default_rng(random_state)
+            return self._from_realisations(rng.integers(0, self._realisations.shape[0], size=S))
+
         mu = np.asarray(self.nodes, dtype=float)
         sd = np.asarray(self.nodes_std, dtype=float)
         if mu.shape != sd.shape or mu.ndim != 2:
@@ -185,11 +277,19 @@ class Geometry:
 
         q can be:
             - (S,)           : same percentiles for every node → output (D, M, S)
+            - (D*M, S)       : one row per coordinate, as drawn by Analysis
+                               (``numRandomVariables`` rows), C order of `nodes`
             - (D, M, S)      : per-node percentiles           → output (D, M, S)
+
+        With realisations, q is (S,) or (1, S) and picks one realisation per
+        sample (see :meth:`realisationIndex`).
 
         Returns:
             (D, M, 1) if all std == 0, else (D, M, S)
         """
+        if self._realisations is not None:
+            return self._from_realisations(self.realisationIndex(q))
+
         mu = np.asarray(self.nodes, dtype=float)
         sd = np.asarray(self.nodes_std, dtype=float)
         if mu.shape != sd.shape or mu.ndim != 2:
@@ -202,11 +302,15 @@ class Geometry:
         if q.ndim == 1:
             # (S,) → (1,1,S) so it broadcasts with (D,M,1)
             q = q[None, None, :]
+        elif q.ndim == 2:
+            if q.shape[0] != mu.size:
+                raise ValueError(f"2D `q` must have {mu.size} rows (one per coordinate); got {q.shape[0]}.")
+            q = q.reshape(mu.shape[0], mu.shape[1], q.shape[1])
         elif q.ndim == 3:
             if q.shape[:2] != mu.shape:
                 raise ValueError(f"`q` leading shape must be (D, M)={mu.shape} for 3D input.")
         else:
-            raise ValueError("`q` must be shape (S,) or (D, M, S).")
+            raise ValueError("`q` must be shape (S,), (D*M, S) or (D, M, S).")
 
         mu3 = mu[..., None]  # (D, M, 1)
         sd3 = sd[..., None]  # (D, M, 1)
@@ -247,6 +351,24 @@ class Geometry:
         return np.allclose(self.nodes[-1, :], other.nodes[0, :], atol=atol)
 
 
+    def _joined_realisations(self, other: "Geometry") -> Optional[np.ndarray]:
+        """Realisations of ``self + other`` as (R, D, N), or None if neither has any.
+
+        Both must have the same number of realisations, matched one to one; a
+        geometry without realisations counts as fixed in all of them.
+        """
+        a, b = self._realisations, other._realisations
+        if a is None and b is None:
+            return None
+        R = (a if a is not None else b).shape[0]
+        if a is not None and b is not None and a.shape[0] != b.shape[0]:
+            raise ValueError(f"Cannot add geometries with {a.shape[0]} and {b.shape[0]} realisations.")
+        if a is None:
+            a = np.broadcast_to(self._nodes, (R,) + self._nodes.shape)
+        if b is None:
+            b = np.broadcast_to(other._nodes, (R,) + other._nodes.shape)
+        return np.concatenate([a, b[:, :, 1:]], axis=2)
+
     def __add__(self, other: "Geometry") -> "Geometry":
         """
         Combine two contiguous profiles into a new one.
@@ -274,11 +396,13 @@ class Geometry:
         new_nodes_std = np.concatenate([self._nodes_std, other._nodes_std[:, 1:]], axis=1)
         new_elements = np.vstack([self._elements, other._elements + offset])
         new_attributes = np.vstack([self._attributes, other._attributes]) if (self._attributes is not None) and (other._attributes is not None) else None
+        new_reals = self._joined_realisations(other)
         return Geometry(
             nodes=new_nodes.T,
             nodes_std=new_nodes_std.T,
             elements=new_elements,
-            attributes=new_attributes
+            attributes=new_attributes,
+            realisations=None if new_reals is None else new_reals.transpose(0, 2, 1),
         )
 
 
@@ -294,7 +418,9 @@ class Geometry:
             (self.attributes is not None and other.attributes is not None)
             ):
             raise ValueError("Cannot add geometries if one has attributes and the other doesn't.")
+        new_reals = self._joined_realisations(other)
         offset = self._nodes.shape[1] - 1
+        self._realisations = new_reals
         self._nodes = np.concatenate([self._nodes, other._nodes[:, 1:]], axis=1)
         self._nodes_std = np.concatenate([self._nodes_std, other._nodes_std[:, 1:]], axis=1)
         self._elements = np.vstack([self._elements, other._elements + offset])
@@ -303,9 +429,10 @@ class Geometry:
 
 
     def __repr__(self) -> str:
+        reals = f", num_realisations={self.numRealisations}" if self._realisations is not None else ""
         return (
             f"Geometry(num_nodes={self._nodes.shape[1]}, "
-            f"num_elements={len(self._elements)})"
+            f"num_elements={len(self._elements)}{reals})"
         )
 
 

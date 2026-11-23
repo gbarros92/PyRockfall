@@ -792,3 +792,107 @@ def test_run_raises_when_not_configured():
     a = Analysis()
     with pytest.raises(ValueError, match="No seeders defined"):
         a.run()
+
+
+def test_run_on_slope_realisations_uses_each_one_equally():
+    # Four flat realisations at y = 0, -1, -2, -3. Blocks dropped with full
+    # absorption land on the realisation they were given; with Latin hypercube
+    # sampling each realisation gets the same number of blocks.
+    nodes = np.array([[-50.0, 0.0], [0.0, 0.0], [50.0, 0.0]])
+    reals = np.stack([nodes - [0.0, k] for k in range(4)])
+    material = pr.Material(name="Flat", normalRestitution=0.0, tangentialRestitution=0.5, frictionAngle=30.0)
+    slope = pr.Slope(pr.Geometry(nodes=nodes, realisations=reals), materials=material)
+    rock = pr.Rock(name="R", mass=10.0, density=2500.0)
+    seeder = pr.Seeder(points=np.array([5.0, 20.0]), rocks=[rock])
+    seeder.numberOfRocks = 8
+    seeder.translationalVelocity = [0.0, 0.0]
+    seeder.angularVelocity = [0.0]
+
+    a = Analysis()
+    a.seeders = [seeder]
+    a.slope = slope
+    a.samplingMethod = Sampling.LatinHypercube
+    a.useSpecificSeed = True
+    a.specificSeed = 1
+    a.maxIter = 500
+    a.gravity = -9.81
+    a.stoppedVelocity = 1e-3
+
+    a.run()
+
+    final_y = a.trajectories._position_history[-1][1]
+    np.testing.assert_allclose(np.sort(final_y), np.repeat([-3.0, -2.0, -1.0, 0.0], 2), atol=1e-6)
+
+
+def test_run_on_slope_with_nodes_std():
+    # Regression test: Analysis passes the slope one row of percentiles per
+    # uncertain coordinate, (N*D, S), which Geometry.ppf used to reject.
+    nodes = np.array([[-50.0, 0.0], [0.0, 0.0], [50.0, 0.0]])
+    nodes_std = np.array([[0.0, 0.0], [0.0, 0.5], [0.0, 0.0]])
+    material = pr.Material(name="Flat", normalRestitution=0.0, tangentialRestitution=0.5, frictionAngle=30.0)
+    slope = pr.Slope(pr.Geometry(nodes=nodes, nodes_std=nodes_std), materials=material)
+    seeder = pr.Seeder(points=np.array([0.0, 20.0]), rocks=[pr.Rock(name="R", mass=10.0, density=2500.0)])
+    seeder.numberOfRocks = 6
+    seeder.translationalVelocity = [0.0, 0.0]
+    seeder.angularVelocity = [0.0]
+
+    a = Analysis()
+    a.seeders = [seeder]
+    a.slope = slope
+    a.useSpecificSeed = True
+    a.maxIter = 500
+    a.run()
+
+    final_y = a.trajectories._position_history[-1][1]
+    assert np.ptp(final_y) > 0.1                      # each block sees its own slope
+    assert np.all(np.abs(final_y) < 4 * 0.5)
+
+
+def test_run_on_slope_realisations_with_sliding_uses_each_blocks_own_slope():
+    # Regression test: process() indexed the per-block slopes and normals with a
+    # mask over the blocks on the slope only, so a sliding block on an uncertain
+    # slope raised IndexError, and blocks on the slope silently got the normals
+    # of sample 0. Two realisations of an incline with a run-out, 1 m apart:
+    # blocks settle on the run-out of their own realisation.
+    nodes = np.array([[0.0, 10.0], [10.0, 0.0], [30.0, 0.0]])
+    reals = np.stack([nodes, nodes - [0.0, 1.0]])
+    material = pr.Material(name="A", normalRestitution=0.2, tangentialRestitution=0.6, frictionAngle=20.0)
+    slope = pr.Slope(pr.Geometry(nodes=nodes, realisations=reals), materials=material)
+    rock = pr.Rock(name="R", mass=10.0, density=2500.0)
+    seeders = []
+    # blocks sliding on the incline while others have flown past the run-out onto the floor
+    for point, vx in (([2.0, 8.5], 0.0), ([25.0, 30.0], 20.0)):
+        seeder = pr.Seeder(points=np.array(point), rocks=[rock])
+        seeder.numberOfRocks = 4
+        seeder.translationalVelocity = [vx, 0.0]
+        seeder.angularVelocity = [0.0]
+        seeders.append(seeder)
+
+    a = Analysis()
+    a.seeders = seeders
+    a.slope = slope
+    a.samplingMethod = Sampling.LatinHypercube
+    a.useSpecificSeed = True
+    a.specificSeed = 1
+    a.maxIter = 3000
+    a.gravity = -9.81
+    a.stoppedVelocity = 1e-3
+    a.timeStep = 0.01
+
+    a.run()
+
+    final_pos = a.trajectories._position_history[-1]
+    assert a.trajectories._position_history.shape[0] < a.maxIter
+    sliding = final_pos[:, a.maps.seederSamples[seeders[0]]]
+    thrown = final_pos[:, a.maps.seederSamples[seeders[1]]]
+    assert np.all((sliding[0] >= 10.0 - 1e-6) & (sliding[0] <= 30.0))   # on the run-out...
+    assert np.all(np.isclose(sliding[1], 0.0, atol=1e-6) | np.isclose(sliding[1], -1.0, atol=1e-6))
+    assert np.all(thrown[0] > 30.0)                                  # ...and past it, on the floor
+    np.testing.assert_allclose(thrown[1], slope.floor, atol=1e-6)
+
+
+def test_sample_normals_rejects_mismatched_samples():
+    from pyrockfall._utils import sampleNormals
+    normals = np.zeros((2, 3, 5))
+    with pytest.raises(ValueError, match="1 or S=3"):
+        sampleNormals(np.zeros((2, 3)), np.array([0, 1, 2]), normals)

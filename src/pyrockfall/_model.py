@@ -21,6 +21,23 @@ from ._frame import CurvilinearFrame
 from ._filesystem import read_properties, write_ply_with_attrs, write_npz_full_fidelity, write_xyz_ascii, write_pcd_minimal
 from ._utils import rotationAlign2x
 
+
+def _slice_positions(positions) -> NDArray[np.float64]:
+    """
+    Validate slice positions given explicitly to ``slice()``.
+
+    Returns them as a 1D float array, in the order given. They must be finite;
+    repeated positions are allowed (each gives its own profile).
+    """
+    pos = np.asarray(positions, dtype=float)
+    if pos.ndim == 0:
+        pos = pos[None]
+    if pos.ndim != 1:
+        raise ValueError("positions must be a 1D sequence of slice positions.")
+    if not np.all(np.isfinite(pos)):
+        raise ValueError("positions must be finite.")
+    return pos
+
 class Model(ABC):
     """
     Base class for geometric data used in rockfall workflows.

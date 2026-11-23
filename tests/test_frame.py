@@ -317,3 +317,18 @@ def test_mesh_frame_uses_triangle_normals():
     sde = m.sde()
     assert not np.isnan(sde).any()
     assert np.ptp(sde[:, 0]) == pytest.approx(30.0, rel=0.01)
+
+
+def test_outward_sign_points_to_the_air_on_a_dipping_face():
+    rng = np.random.default_rng(0)
+    truth = pr.CurvilinearFrame([[0.0, 0.0], [30.0, 0.0]])
+    e = rng.uniform(0, 10, 3000)
+    sde = np.column_stack([rng.uniform(0, 30, 3000), -(e - 5) / np.tan(np.radians(50.0)), e])
+    pc = pr.PointCloud(points=truth.sde_to_xyz(sde))
+    frame = pc.fitFrame()
+    pc.uvw()
+    out = frame.outward_sign()
+    # moving along +out*w from the face goes up (into the air above a dipping face)
+    p0 = frame.uvw_to_xyz(np.array([[0.0, 0.0, 0.0]]))[0]
+    p1 = frame.uvw_to_xyz(np.array([[0.0, 0.0, out]]))[0]
+    assert p1[2] > p0[2]

@@ -923,11 +923,12 @@ class Analysis:
         # Check for block inside slope
         is_on_el = element_id >= 0
         if np.any(is_on_el):
-            pos_on_el, vel_on_el, id_on_el = getSubSamples(is_on_el,
+            # profiles/slope_normals are per block when the slope is uncertain: subset them too
+            pos_on_el, vel_on_el, id_on_el, sn_on_el = getSubSamples(is_on_el,
                 position, velocity,
-                element_id
+                element_id, slope_normals,
             )
-            normal_on_el = sampleNormals(pos_on_el, id_on_el, slope_normals)
+            normal_on_el = sampleNormals(pos_on_el, id_on_el, sn_on_el)
             is_inside = (normal_on_el[-1] < 0) & (time_hit[is_on_el] > self.tolerance)
             if np.any(is_inside):
                 dlt_h = -time_hit[is_on_el][is_inside]
@@ -967,16 +968,16 @@ class Analysis:
             is_sliding = np.full_like(is_on_el, False, dtype=bool)
             if np.any(is_on_el):
                 # get samples on elements
-                pos_on_el, vel_on_el, acc_on_el, w_on_el, rp_on_el, t_on_el, id_on_el = getSubSamples(is_on_el,
+                pos_on_el, vel_on_el, acc_on_el, w_on_el, rp_on_el, t_on_el, id_on_el, pro_on_el, sn_on_el = getSubSamples(is_on_el,
                     position, velocity, acceleration, angular_velocity,
-                    rock_params, time, element_id,
+                    rock_params, time, element_id, profiles, slope_normals,
                 )
 
                 # materials at impact locations
                 mp_on_el = self._impactMaterial(id_on_el, material_params)
 
                 # get normal and tangential velocities
-                normal_on_el = sampleNormals(pos_on_el, id_on_el, slope_normals)
+                normal_on_el = sampleNormals(pos_on_el, id_on_el, sn_on_el)
                 normal_on_el = self._addRoughness(normal_on_el, id_on_el, roughness_samples, cum_impacts)
                 vn_on_el, vt_on_el = decompose(vel_on_el, normal_on_el)
                 an_on_el, at_on_el = decompose(acc_on_el, normal_on_el)
@@ -1040,7 +1041,7 @@ class Analysis:
                     pos_s, vt_s, t_s, normal_s, phi_s, pro_s, id_s = getSubSamples(is_sliding_on_el,
                         pos_on_el, vt_on_el, t_on_el,
                         normal_on_el, mp_on_el[2],
-                        profiles, id_on_el
+                        pro_on_el, id_on_el
                     )
                     pos_s, vt_s, at_s, dt_s, id_s = self._slide(pos_s, vt_s, normal_s, phi_s, pro_s, id_s)
                     t_s += dt_s

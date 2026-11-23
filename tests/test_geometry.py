@@ -144,8 +144,8 @@ def test_ppf_3d_q_matches_1d_q_broadcast():
 
 def test_ppf_rejects_wrong_q_ndim():
     g = make_polyline_geometry()
-    with pytest.raises(ValueError, match=r"`q` must be shape \(S,\) or \(D, M, S\)"):
-        g.ppf(np.zeros((2, 2)))
+    with pytest.raises(ValueError, match=r"`q` must be shape \(S,\), \(D\*M, S\) or \(D, M, S\)"):
+        g.ppf(np.zeros((2, 2, 2, 2)))
 
 
 def test_ppf_rejects_mismatched_3d_leading_shape():
@@ -449,3 +449,98 @@ def test_intersect_damped_vectorised_matches_per_sample_calls():
         )
         assert seg_batch[i] == seg_single[0]
         assert t_batch[i] == pytest.approx(t_single[0], rel=1e-8, nan_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Realisations: samples drawn from complete versions of the geometry
+# ---------------------------------------------------------------------------
+
+def make_realisation_geometry(R=4):
+    nodes = np.array([[0.0, 2.0], [1.0, 1.0], [2.0, 0.0]])
+    offsets = np.arange(R, dtype=float)[:, None, None] * np.array([0.0, 0.1])  # each one 0.1 higher
+    return pr.Geometry(nodes=nodes, realisations=nodes[None] + offsets), nodes + offsets
+
+
+def test_realisations_properties():
+    g, reals = make_realisation_geometry()
+    assert g.numRealisations == 4
+    assert g.numRandomVariables == 1
+    assert bool(g.hasUncertainty) is True
+    np.testing.assert_array_equal(g.realisations, reals)
+    assert "num_realisations=4" in repr(g)
+    assert pr.Geometry(nodes=reals[0]).realisations is None
+    assert pr.Geometry(nodes=reals[0]).numRealisations == 0
+
+
+def test_realisations_ppf_picks_floor_q_times_R():
+    g, reals = make_realisation_geometry()
+    q = np.array([0.0, 0.24, 0.25, 0.6, 0.999, 1.0])
+    np.testing.assert_array_equal(g.realisationIndex(q), [0, 0, 1, 2, 3, 3])
+    out = g.ppf(q[None, :])          # (1, S), as drawn by Analysis
+    assert out.shape == (3, 2, q.size)
+    for k, r in enumerate([0, 0, 1, 2, 3, 3]):
+        np.testing.assert_array_equal(out[:, :, k], reals[r])
+    np.testing.assert_array_equal(g.ppf(q), out)  # (S,) works too
+
+
+def test_realisations_stratified_percentiles_use_every_realisation_equally():
+    g, _ = make_realisation_geometry(R=5)
+    q = (np.arange(20) + 0.5) / 20
+    np.testing.assert_array_equal(np.bincount(g.realisationIndex(q), minlength=5), [4] * 5)
+
+
+def test_realisations_rvs_draws_reproducibly_from_the_realisations():
+    g, reals = make_realisation_geometry()
+    a = g.rvs(50, random_state=3)
+    assert a.shape == (3, 2, 50)
+    np.testing.assert_array_equal(a, g.rvs(50, random_state=3))
+    for k in range(a.shape[2]):
+        assert any(np.array_equal(a[:, :, k], r) for r in reals)
+
+
+def test_realisations_floor_includes_the_lowest_realisation():
+    nodes = np.array([[0.0, 1.0], [1.0, 0.0]])
+    g = pr.Geometry(nodes=nodes, realisations=np.stack([nodes, nodes - [0.0, 0.5]]))
+    assert g.floor == pytest.approx(-0.5)
+
+
+def test_realisations_validation():
+    nodes = np.array([[0.0, 1.0], [1.0, 0.0]])
+    with pytest.raises(ValueError, match="realisations must have shape"):
+        pr.Geometry(nodes=nodes, realisations=np.zeros((2, 3, 2)))
+    with pytest.raises(ValueError, match="finite"):
+        pr.Geometry(nodes=nodes, realisations=np.full((2, 2, 2), np.nan))
+    with pytest.raises(ValueError, match="no realisations"):
+        pr.Geometry(nodes=nodes).realisationIndex([0.5])
+    g, _ = make_realisation_geometry()
+    with pytest.raises(ValueError, match=r"\(S,\) or \(1, S\)"):
+        g.ppf(np.full((2, 3), 0.5))
+
+
+def test_add_joins_realisations_one_to_one():
+    a_nodes = np.array([[0.0, 2.0], [1.0, 1.0]])
+    b_nodes = np.array([[1.0, 1.0], [2.0, 0.0]])
+    a = pr.Geometry(nodes=a_nodes, realisations=np.stack([a_nodes, a_nodes + 1.0]))
+    b = pr.Geometry(nodes=b_nodes, realisations=np.stack([b_nodes, b_nodes + 2.0]))
+    ab = a + b
+    np.testing.assert_array_equal(ab.realisations[1], [[1.0, 3.0], [2.0, 2.0], [4.0, 2.0]])
+    # a fixed geometry is the same in every realisation
+    fixed = pr.Geometry(nodes=b_nodes)
+    af = a + fixed
+    assert af.numRealisations == 2
+    np.testing.assert_array_equal(af.realisations[1, -1], b_nodes[-1])
+    a += fixed
+    np.testing.assert_array_equal(a.realisations, af.realisations)
+    with pytest.raises(ValueError, match="1 and 2 realisations"):
+        pr.Geometry(nodes=a_nodes, realisations=a_nodes[None]) + b
+
+
+def test_ppf_accepts_one_row_per_coordinate_as_drawn_by_analysis():
+    g = make_polyline_geometry()
+    rng = np.random.default_rng(0)
+    q3 = rng.uniform(0.01, 0.99, size=g.nodes.shape + (5,))
+    q2 = q3.reshape(-1, 5)           # (numRandomVariables, S)
+    assert q2.shape[0] == g.numRandomVariables
+    np.testing.assert_array_equal(g.ppf(q2), g.ppf(q3))
+    with pytest.raises(ValueError, match="one per coordinate"):
+        g.ppf(q2[:-1])

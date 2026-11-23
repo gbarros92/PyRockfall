@@ -525,6 +525,13 @@ class CurvilinearFrame:
     def uvw_to_xyz(self, uvw):
         return self.sde_to_xyz(self.uvw_to_sde(uvw))
 
+    def outward_sign(self) -> float:
+        """+1 if ``+w`` points out of the wall (towards the air, where a scanner
+        sees it from), -1 otherwise. On a face that is not overhanging overall
+        the outward direction has an upward component."""
+        self._require_pca()
+        return 1.0 if self.pca_axes[2, 2] >= 0 else -1.0
+
     def horizontal_angle_uv(self) -> float:
         """Angle (degrees, CCW from U) of horizontal lines within the U-V plane.
 

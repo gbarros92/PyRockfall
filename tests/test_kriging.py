@@ -465,3 +465,120 @@ def test_fill_holes_uv_ignores_a_second_layer_and_records_its_training_points():
     assert "structures" in h["w_variogram"]
     single = fill_holes_uv(kept, cell=0.8, dense_variogram=False)["holes"][0]["w_variogram"]
     assert "model" in single
+
+
+# ---------------------------------------------------------------------------
+# Inequality data: truncated Gaussian, kriging covariance, censored moments
+# ---------------------------------------------------------------------------
+from pyrockfall._kriging import kriging_conditional, truncated_gaussian_gibbs, censored_moments
+
+
+def test_truncated_gaussian_gibbs_matches_rejection_sampling():
+    rng = np.random.default_rng(0)
+    assert truncated_gaussian_gibbs([0.0], [[1.0]], [0.0], 20000, rng=rng, sweeps=1).mean() == pytest.approx(
+        -np.sqrt(2 / np.pi), abs=0.02)                                  # half-normal
+    mean, cov, upper = np.zeros(2), np.array([[1.0, 0.8], [0.8, 1.0]]), np.array([0.0, 0.5])
+    g = truncated_gaussian_gibbs(mean, cov, upper, 20000, rng=rng, sweeps=30)
+    z = rng.multivariate_normal(mean, cov, 400000)
+    z = z[(z <= upper).all(axis=1)]
+    assert np.all(g <= upper)
+    np.testing.assert_allclose(g.mean(axis=0), z.mean(axis=0), atol=0.02)
+    np.testing.assert_allclose(np.cov(g.T), np.cov(z.T), atol=0.02)
+
+
+def test_truncated_gaussian_gibbs_far_tail_and_validation():
+    rng = np.random.default_rng(1)
+    g = truncated_gaussian_gibbs([0.0, 0.0], np.eye(2), [-40.0, np.inf], 500, rng=rng, sweeps=3)
+    assert np.all(g[:, 0] <= -40.0) and np.all(g[:, 0] > -40.2)        # pinned near a far bound
+    assert abs(g[:, 1].mean()) < 0.15                                    # the other is free
+    assert truncated_gaussian_gibbs([], np.empty((0, 0)), [], 3).shape == (3, 0)
+    with pytest.raises(ValueError, match="shapes"):
+        truncated_gaussian_gibbs([0.0, 0.0], np.eye(3), [0.0, 0.0], 2)
+    with pytest.raises(ValueError, match="satisfy the bounds"):
+        truncated_gaussian_gibbs([0.0], [[1.0]], [0.0], 2, init=np.ones((2, 1)))
+    # nearly coincident points: a singular covariance still samples
+    v = Variogram("gaussian", psill=1.0, range=5.0)
+    pts = np.array([[0.0, 0.0], [1e-6, 0.0], [3.0, 0.0]])
+    S = 1.0 - v.gamma(np.linalg.norm(pts[:, None] - pts[None], axis=-1))
+    g = truncated_gaussian_gibbs(np.zeros(3), S, np.array([-1.0, -1.0, np.inf]), 200, rng=rng, sweeps=5)
+    assert np.all(g[:, :2] <= -1.0) and np.allclose(g[:, 0], g[:, 1], atol=0.05)
+    with pytest.raises(ValueError, match="semi-"):
+        truncated_gaussian_gibbs([0.0, 0.0], -np.eye(2), [0.0, 0.0], 2)
+
+
+def test_kriging_conditional_matches_kriging_and_simulated_errors():
+    rng = np.random.default_rng(2)
+    v = Variogram("spherical", psill=1.0, range=5.0, nugget=0.1)
+    xy, vals = rng.uniform(0, 10, (40, 2)), rng.normal(size=40)
+    new = np.array([[5.0, 5.0], [5.5, 5.0], [9.0, 1.0]])
+    mean, S = kriging_conditional(xy, vals, new, v)
+    est, var = ordinary_kriging(xy, vals, new, v)
+    np.testing.assert_allclose(mean, est)
+    np.testing.assert_allclose(np.diag(S), var)
+    real, _, _ = conditional_simulation(xy, vals, new, v, 30000, rng=rng, resolution=0.1)
+    np.testing.assert_allclose(np.cov(real.T), S, atol=0.02)
+    m0, S0 = kriging_conditional(xy, vals, np.empty((0, 2)), v)
+    assert m0.shape == (0,) and S0.shape == (0, 0)
+
+
+def test_censored_moments_match_monte_carlo():
+    rng = np.random.default_rng(3)
+    mu = np.array([[0.0, 1.0], [2.0, 2.0], [-3.0, -1.0]])
+    sd = np.array([1.0, 0.5, 0.0])
+    ub = np.array([0.5, 1.0, -2.0])
+    m, v = censored_moments(mu, sd, ub)
+    x = mu[:, rng.integers(0, 2, 400000)] + sd[:, None] * rng.standard_normal((3, 400000))
+    y = np.minimum(x, ub[:, None])
+    np.testing.assert_allclose(m, y.mean(axis=1), atol=0.01)
+    np.testing.assert_allclose(v, y.var(axis=1), atol=0.01)
+
+
+def test_conditional_simulation_with_one_value_column_per_realisation():
+    rng = np.random.default_rng(4)
+    v = Variogram("spherical", psill=1.0, range=5.0)
+    xy = np.array([[0.0, 0.0], [10.0, 0.0]])
+    vals = np.array([[0.0, 1.0, 2.0], [0.0, -1.0, -2.0]])            # (n, k)
+    real, est, _ = conditional_simulation(xy, vals, xy, v, 3, rng=rng, resolution=0.5)
+    np.testing.assert_allclose(real, vals.T, atol=1e-6)                 # each honours its own data
+    assert est.shape == (2, 3)
+    with pytest.raises(ValueError, match="k=4"):
+        conditional_simulation(xy, vals, xy, v, 4, rng=rng)
+
+
+def test_fill_holes_uv_keeps_the_surface_behind_the_cover():
+    # A recess 1 m deep hidden by vegetation 5-60 cm in front of it (+w)
+    rng = np.random.default_rng(1)
+    n = 12000
+    u, v = rng.uniform(0, 60, n), rng.uniform(0, 20, n)
+    bowl = lambda uu, vv: -np.clip(1 - (np.hypot(uu - 30, vv - 10) / 4) ** 2, 0, None)
+    w = 0.02 * rng.standard_normal(n) + bowl(u, v)
+    hole = np.hypot(u - 30, v - 10) < 4
+    vu, vv = 30 + rng.uniform(-4, 4, 4000), 10 + rng.uniform(-4, 4, 4000)
+    keep = np.hypot(vu - 30, vv - 10) < 4
+    vu, vv = vu[keep], vv[keep]
+    cover = np.column_stack([vu, vv, bowl(vu, vv) + rng.uniform(0.05, 0.6, vu.size)])
+    uvw = np.column_stack([u, v, w])
+    kw = dict(cell=0.8, removed_uv=uvw[hole, :2])
+    free = fill_holes_uv(uvw[~hole], **kw)
+    res = fill_holes_uv(uvw[~hole], cover_uvw=cover, cover_side=1, **kw)
+    from scipy.spatial import cKDTree
+
+    def stats(r):
+        p = r["uvw"]
+        _, i = cKDTree(p[:, :2]).query(cover[:, :2])
+        behind = np.mean(cover[:, 2] < p[i, 2] - 0.02)
+        return behind, np.sqrt(np.mean((p[:, 2] - bowl(p[:, 0], p[:, 1])) ** 2))
+
+    behind_free, rmse_free = stats(free)
+    behind, rmse = stats(res)
+    assert behind_free > 0.5 and behind == 0.0
+    assert rmse < 0.3 * rmse_free
+    B = res["cover_bound"]
+    hb = np.isfinite(B)
+    assert hb.mean() > 0.8 and np.all(res["uvw"][hb, 2] <= B[hb] + 1e-9)
+    assert np.all(res["free_w"][hb] > res["uvw"][hb, 2] - 1e-9)        # pushed back, never forward
+    assert np.all(np.isnan(free["cover_bound"])) and free["cover_side"] is None
+    h = res["holes"][0]
+    assert h["n_cover_active"] > 0 and len(h["cover"]["uv"]) == h["n_cover_active"]
+    with pytest.raises(ValueError, match="cover_side"):
+        fill_holes_uv(uvw[~hole], cover_uvw=cover, cover_side=0, **kw)

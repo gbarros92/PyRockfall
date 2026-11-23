@@ -644,3 +644,83 @@ def test_slice_methods_agree_and_invalid_method_raises():
         assert len(a.attributes) == a.nodes.shape[0] - 1
     with pytest.raises(ValueError, match="method must be"):
         pc.slice(increment=3.0, label="mat", method="spline")
+
+
+# ---------------------------------------------------------------------------
+# slice(positions=...): several models cut at the same places
+# ---------------------------------------------------------------------------
+
+def test_slice_at_given_positions_matches_the_default_grid():
+    pts, mat = corner_wall()
+    pc = pr.PointCloud(points=pts)
+    pc.set_attr("mat", mat)
+    grid, s_grid = pc.slice(increment=2.0, label="mat", slice_height_increment=0.5)
+    given, s_given = pc.slice(increment=2.0, label="mat", slice_height_increment=0.5, positions=s_grid)
+    np.testing.assert_array_equal(s_given, s_grid)
+    for a, b in zip(grid, given):
+        np.testing.assert_array_equal(a.nodes, b.nodes)
+        np.testing.assert_array_equal(a.attributes, b.attributes)
+
+
+def test_slice_two_clouds_of_one_wall_at_the_same_positions():
+    pts, mat = corner_wall()
+    full = pr.PointCloud(points=pts)
+    full.set_attr("mat", mat)
+    # a part of the wall that starts elsewhere: its own grid would not line up
+    keep = full.sde()[:, 0] > 13.3
+    part = pr.PointCloud(points=pts[keep])
+    part.set_attr("mat", mat[keep])
+    part.frame = full.frame
+    stations = np.array([-5.0, 7.0, 20.0, 41.5, 100.0])  # the first and last fall outside the wall
+    _, s_full = full.slice(increment=1.0, label="mat", positions=stations)
+    prof_part, s_part = part.slice(increment=1.0, label="mat", positions=stations)
+    np.testing.assert_array_equal(s_full, [7.0, 20.0, 41.5])
+    np.testing.assert_array_equal(s_part, [20.0, 41.5])
+    _, s_own = part.slice(increment=1.0, label="mat")
+    assert not np.isin(s_part, s_own).all()               # the default grid starts at the cloud
+    assert len(prof_part) == 2
+
+
+def test_slice_rejects_invalid_positions():
+    pts, mat = two_material_wall()
+    pc = pr.PointCloud(points=pts)
+    pc.set_attr("mat", mat)
+    with pytest.raises(ValueError, match="finite"):
+        pc.slice(increment=1.0, label="mat", positions=[1.0, np.nan])
+    with pytest.raises(ValueError, match="1D"):
+        pc.slice(increment=1.0, label="mat", positions=[[1.0, 2.0]])
+
+
+def test_section_at_given_positions():
+    pts, mat = corner_wall()
+    pc = pr.PointCloud(points=pts)
+    pc.set_attr("mat", mat)
+    profiles, sections_pc = pc.section(increment=1.0, label="mat", positions=[10.0, 35.0])
+    assert len(profiles) == 2
+    s = pc.frame.xyz_to_sde(sections_pc.points)[:, 0]
+    np.testing.assert_allclose(np.unique(np.round(s, 6)), [10.0, 35.0], atol=1e-6)
+
+
+def test_fill_holes_cover_side_on_a_vertical_wall():
+    # On a vertical face "outward" cannot be read from the frame: normals or an
+    # explicit side are needed
+    rng = np.random.default_rng(0)
+    x, z = rng.uniform(0, 30, 6000), rng.uniform(0, 12, 6000)
+    pts = np.column_stack([x, 0.01 * rng.standard_normal(6000), z])
+    mat = np.where(np.hypot(x - 15, z - 6) < 2.5, 0, 1)
+    pc = pr.PointCloud(points=pts)
+    pc.set_attr("mat", mat)
+    pc.removePoints("mat", 0)
+    with pytest.raises(ValueError, match="nearly vertical"):
+        pc.fillHoles(attributes=["mat"], cover="removed")
+    with pytest.raises(ValueError, match="'removed'"):
+        pc.fillHoles(attributes=["mat"], cover="vegetation")
+    with pytest.raises(ValueError, match="cover_side must be"):
+        pc.fillHoles(attributes=["mat"], cover="removed", cover_side=2)
+    filled, info = pc.fillHoles(attributes=["mat"], cover="removed", cover_side=-1, return_info=True)
+    assert info["cover_side"] == -1.0 and filled.has_attr("cover_bound")
+    # normals pointing to -y give the same side as the w axis along -y, or the opposite
+    pc.set_attr("normals", np.tile([0.0, -1.0, 0.0], (pc.points.shape[0], 1)))
+    w_y = pc.frame.uvw_to_xyz(np.array([[0.0, 0.0, 1.0]]))[0] - pc.frame.uvw_to_xyz(np.zeros((1, 3)))[0]
+    _, info = pc.fillHoles(attributes=["mat"], cover="removed", return_info=True)
+    assert info["cover_side"] == (1.0 if w_y[1] < 0 else -1.0)

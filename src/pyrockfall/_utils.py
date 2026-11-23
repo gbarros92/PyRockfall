@@ -1885,6 +1885,10 @@ def sampleNormals(position: np.ndarray, elementsIDs: np.ndarray, elementNormals:
     ids_safe = np.where(hit, elementsIDs, 0)             # avoid OOB for -1
 
     # choose sample axis selector: 0 if element_norm has only one slice; else 0..S-1
+    if elementNormals.shape[2] not in (1, S):
+        raise ValueError(
+            f"elementNormals must have 1 or S={S} samples on its last axis; got {elementNormals.shape[2]}."
+        )
     sel = np.arange(S) if elementNormals.shape[2] == S else np.zeros(S, dtype=int)
 
     # vectorised gather: result is (D, S)
