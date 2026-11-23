@@ -230,6 +230,8 @@ class CurvilinearFrame:
     ``p = V_i + t e_i + d ((1 - t) m_i + t m_{i+1})`` with ``t`` in ``[0, 1]``, which
     is continuous across vertices and invertible while ``d`` stays within
     :meth:`fold_limits` (offset lines on the inner side of a bend collapse beyond that).
+    Past the end vertices the first and last segments run straight on, with the offset
+    along their normals, so ``s`` there is the distance along that straight extension.
 
     Principal coordinates ``(u, v, w)``: one global PCA of ``(s, d, e)``. ``u`` and
     ``v`` span the best-fit plane of the unrolled face (``u`` along ``+s``, ``v``
@@ -336,9 +338,13 @@ class CurvilinearFrame:
         sde = frame.xyz_to_sde(xyz)
         ok = np.isfinite(sde).all(axis=1)
         d, e = sde[ok, 1], sde[ok, 2]
-        d_max = float(np.abs(d).max()) if d.size else 0.0
         if d.size > 2 and d.std() > 0 and e.std() > 0 and np.corrcoef(d, e)[0, 1] > 0.1:
             frame = cls(V[::-1])
+
+        frame = frame._trim_folding_ends(xyz)
+        d = frame.xyz_to_sde(xyz)[:, 1]
+        d = d[np.isfinite(d)]
+        d_max = float(np.abs(d).max()) if d.size else 0.0
 
         if corner_length is not None:
             frame = frame.refine_corners(corner_length, d_max=d_max, min_turn=min_turn)
@@ -361,6 +367,36 @@ class CurvilinearFrame:
         if nu == 0:
             raise ValueError("direction cannot be zero.")
         return cls(np.array([o, o + u / nu]))
+
+    def _trim_folding_ends(self, xyz) -> "CurvilinearFrame":
+        """Drop end segments too short for the bend at their inner end.
+
+        An end segment's offset lines fold over at ``fold_limits()``, about
+        ``L / tan(turn / 2)`` on the inner side of its bend. When that is closer to
+        the wall line than the points reach on that side, the segment cannot map the
+        wall around it: it is a hook fitted to an edge effect at the end of the strip
+        (e.g. a short stretch of face along the clipped border of the cloud). The
+        neighbouring segment is extended over it instead.
+        """
+        frame = self
+        while frame.n_segments > 1:
+            d = frame.xyz_to_sde(xyz)[:, 1]
+            d = d[np.isfinite(d)]
+            reach = np.array([max(d.max(initial=0.0), 0.0), max(-d.min(initial=0.0), 0.0)])
+            lim = frame.fold_limits()
+            V = frame.polyline
+            if np.any(lim[0] < reach):                       # first segment
+                e = frame.Eh[1]
+                t = min(float((V[0] - V[1]) @ e), 0.0)       # V0 projected on segment 1
+                V = np.vstack([V[1] + t * e, V[2:]]) if t < 0 else V[1:]
+            elif np.any(lim[-1] < reach):                    # last segment
+                e = frame.Eh[-2]
+                t = max(float((V[-1] - V[-2]) @ e), 0.0)
+                V = np.vstack([V[:-2], V[-2] + t * e]) if t > 0 else V[:-1]
+            else:
+                break
+            frame = CurvilinearFrame(V)
+        return frame
 
     def refine_corners(self, length: Union[str, float] = "auto", *, d_max: Optional[float] = None,
                        min_turn: float = 5.0, margin: float = 1.5) -> "CurvilinearFrame":
@@ -456,14 +492,22 @@ class CurvilinearFrame:
             den = self.L[i] + di * b_e                          # > 0 inside the fold limit
             with np.errstate(divide='ignore', invalid='ignore'):
                 t = (q @ self.Eh[i] - di * a_e) / den
-            ok = den > 0
-            if i > 0:
-                ok &= t >= 0
-            if i < K - 1:
-                ok &= t <= 1
+            ok = (den > 0) & (t >= 0) & (t <= 1)
+            si = self.S0[i] + t * self.L[i]
+            # Beyond the end vertices the wall line runs straight on and the offset
+            # direction stays the end normal (M = N there). Extrapolating the mitre
+            # instead would keep turning the offset lines until they fold, and send s
+            # to +-infinity as den -> 0.
+            if i == 0:
+                along = q @ self.Eh[0]
+                ext = along < 0
+                si[ext], ok[ext] = along[ext], True
+            if i == K - 1:
+                along = (P - self.polyline[K]) @ self.Eh[K - 1]
+                ext = along > 0
+                si[ext], ok[ext] = self.S0[K] + along[ext], True
             # a point exactly on a shared mitre line is valid for both segments: only
             # count it as ambiguous if the two solutions differ
-            si = self.S0[i] + t * self.L[i]
             dup = ok & ~np.isnan(s) & (np.abs(si - s) < 1e-9) & (np.abs(di - d) < 1e-9)
             n_valid += (ok & ~dup)
             better = ok & ~dup & (np.isnan(d) | (np.abs(di) < np.abs(d)))
@@ -479,7 +523,8 @@ class CurvilinearFrame:
         s, d = sde[:, 0], sde[:, 1]
         i = np.clip(np.searchsorted(self.S0, s, side='right') - 1, 0, self.n_segments - 1)
         t = (s - self.S0[i]) / self.L[i]
-        off = (1 - t)[:, None] * self.M[i] + t[:, None] * self.M[i + 1]
+        tc = np.clip(t, 0.0, 1.0)                               # fixed offset past the ends
+        off = (1 - tc)[:, None] * self.M[i] + tc[:, None] * self.M[i + 1]
         xy = self.polyline[i] + (t * self.L[i])[:, None] * self.Eh[i] + d[:, None] * off
         return np.column_stack([xy, sde[:, 2]])
 

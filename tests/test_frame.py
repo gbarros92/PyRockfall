@@ -141,14 +141,32 @@ def test_uvw_requires_pca():
         f.sde_to_uvw(np.zeros((1, 3)))
 
 
-def test_points_beyond_fold_limit_are_nan():
+def test_fold_limits_and_points_past_them():
     f = CurvilinearFrame([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]])
     lim = f.fold_limits()
     assert np.isfinite(lim[:, 0]).all() and np.isinf(lim[:, 1]).all()   # inner side is the left
     np.testing.assert_allclose(lim[:, 0], 10.0)
-    sde = f.xyz_to_sde(np.array([[-1.0, 11.0, 0.0], [5.0, 9.0, 0.0]]))  # past / within the limit
-    assert np.isnan(sde[0, 0])
-    assert np.isfinite(sde[1]).all()
+    sde = f.xyz_to_sde(np.array([[5.0, 9.0, 0.0], [-1.0, 11.0, 0.0]]))
+    assert np.isfinite(sde[0]).all()                                   # within the limit
+    # past segment 0's fold limit, but behind the start: the wall line runs straight on
+    np.testing.assert_allclose(sde[1, :2], [-1.0, 11.0])
+
+
+def test_xyz_to_sde_is_bounded_past_the_ends():
+    # Regression: past an end vertex the mitred offset direction was extrapolated, so
+    # it kept turning until the offset lines folded and s ran off to +-infinity.
+    f = CurvilinearFrame([[0.0, 0.0], [40.0, 0.0], [45.0, 8.0]])        # short, sharp end
+    g = np.mgrid[-20:70:0.5, -30:30:0.5].reshape(2, -1).T
+    xyz = np.column_stack([g, np.zeros(len(g))])
+    sde = f.xyz_to_sde(xyz)
+    ok = np.isfinite(sde[:, 0])
+    s = sde[ok, 0]
+    assert s.min() >= -np.hypot(*(g - f.polyline[0]).T).max()
+    assert s.max() <= f.length + np.hypot(*(g - f.polyline[-1]).T).max()
+    np.testing.assert_allclose(f.sde_to_xyz(sde[ok]), xyz[ok], atol=1e-8)
+    # beyond the last vertex s is the distance along the last segment's line
+    p = f.polyline[-1] + 5.0 * f.Eh[-1] + 3.0 * f.N[-1]
+    np.testing.assert_allclose(f.xyz_to_sde(np.array([[*p, 0.0]]))[0, :2], [f.length + 5.0, 3.0])
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +317,35 @@ def test_model_normals_on_a_laid_back_wall_match_the_fit_without():
     assert np.degrees(f.turning_angles()[0]) == pytest.approx(90.0, abs=3.0)
     info = f.diagnostics(xyz)
     assert info["n_nan"] == 0 and info["n_ambiguous"] == 0 and info["n_past_fold"] == 0
+
+
+def hooked_wall(n=20000, seed=0, length=100.0, height=50.0, dip=50.0, hook=9.0, turn=65.0):
+    """Straight laid-back wall along x plus a stub of face at mid elevation that runs
+    ``hook`` m off its end at ``turn`` degrees, like the face along a clipped border."""
+    rng = np.random.default_rng(seed)
+    x = rng.uniform(0.0, length, n)
+    e = rng.uniform(0.0, height, n)
+    y = (e - 0.5 * height) / np.tan(np.radians(dip)) + 0.05 * rng.standard_normal(n)
+    m = n // 40
+    a, u = np.radians(turn), rng.uniform(0.0, hook, m)
+    stub = np.column_stack([length + u * np.cos(a), u * np.sin(a), 0.5 * height + rng.uniform(-1, 1, m)])
+    xyz = np.vstack([np.column_stack([x, y, e]), stub])
+    normals = np.tile([0.0, -np.sin(np.radians(dip)), np.cos(np.radians(dip))], (n + m, 1))
+    return xyz, normals
+
+
+def test_fit_drops_a_hooked_end_segment_that_folds():
+    # Regression (susan.ply with normals): the band followed a short stub of face off
+    # the end of the wall, giving a 9 m end segment turned back 65 degrees whose fold
+    # limit (~14 m) is narrower than the wall (+-21 m), and s values of tens of km.
+    xyz, normals = hooked_wall()
+    for corner_length in (None, "auto"):
+        f = pr.PointCloud(points=xyz, normals=normals).fitFrame(corner_length=corner_length)
+        assert np.degrees(f.turning_angles()).max(initial=0.0) < 5.0
+        assert f.length == pytest.approx(100.0, abs=5.0)
+        s = f.xyz_to_sde(xyz)[:, 0]
+        assert not np.isnan(s).any()
+        assert -1.0 < s.min() and s.max() < f.length + 1.0
 
 
 def test_fit_polyline_refits_do_not_diverge_on_a_wide_strip():
