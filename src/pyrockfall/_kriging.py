@@ -25,7 +25,7 @@ of a :class:`~._frame.CurvilinearFrame`.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, replace
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -488,6 +488,26 @@ def fit_nested_variogram(
     return out
 
 
+# Smallest nugget, relative to the sill, used when a kriging system is solved
+MIN_REL_NUGGET = 1e-8
+
+
+def _solvable(variogram: AnyVariogram) -> AnyVariogram:
+    """The variogram with a nugget of at least ``MIN_REL_NUGGET`` times its sill.
+
+    A Gaussian structure without nugget, which fits smooth noise-free data,
+    makes the kriging matrix numerically singular (condition numbers of 1e20
+    and more), so rounding errors decide the weights. The tiny nugget bounds
+    the condition number by about ``n / MIN_REL_NUGGET`` and changes the
+    estimate by far less than the kriging error; data points are still
+    honoured exactly.
+    """
+    floor = MIN_REL_NUGGET * float(variogram.psill + variogram.nugget)
+    if variogram.nugget >= floor:
+        return variogram
+    return replace(variogram, nugget=floor)
+
+
 # ---------------------------------------------------------------------------
 # Ordinary kriging
 # ---------------------------------------------------------------------------
@@ -525,6 +545,7 @@ def ordinary_kriging(
     variance : (m,) array
         Kriging variance, in the units of the variogram.
     """
+    variogram = _solvable(variogram)
     xy = variogram.transform(np.asarray(xy, dtype=float))
     x0 = variogram.transform(np.asarray(xy_new, dtype=float))
     vals = np.asarray(values, dtype=float)
@@ -614,6 +635,7 @@ def kriging_conditional(xy, values, xy_new, variogram: AnyVariogram) -> Tuple[np
     estimate : (m,) array
     covariance : (m, m) array
     """
+    variogram = _solvable(variogram)
     X = variogram.transform(np.asarray(xy, dtype=float))
     C = variogram.transform(np.asarray(xy_new, dtype=float))
     vals = np.asarray(values, dtype=float).ravel()
