@@ -122,6 +122,33 @@ def test_kriging_weights_sum_to_one():
         assert np.all(var >= 0)
 
 
+def test_kriging_with_a_gaussian_variogram_and_no_nugget_is_stable():
+    # Smooth, noise-free data fitted with a Gaussian structure and no nugget make
+    # the system numerically singular, and estimates inside a hole, from a ring
+    # of data, amplify that: rounding noise in the data must not move them
+    rng = np.random.default_rng(3)
+    xy = rng.uniform(-7, 7, size=(4000, 2))
+    r = np.hypot(xy[:, 0], xy[:, 1])
+    xy = xy[(r > 4) & (r < 7)][:1000]
+    new = rng.uniform(-3.5, 3.5, size=(400, 2))
+    new = new[np.hypot(new[:, 0], new[:, 1]) < 3.5][:150]
+
+    def surface(p):
+        return 0.3 * np.sin(p[:, 0] / 6.0) + 0.002 * p[:, 1] ** 2
+
+    z = surface(xy)
+    v = Variogram("gaussian", psill=1e-3, range=3.0, nugget=0.0)
+    ests = [ordinary_kriging(xy, z + rng.normal(0, 1e-12, z.size), new, v)[0] for _ in range(4)]
+    for est in ests[1:]:
+        np.testing.assert_allclose(est, ests[0], atol=1e-6)
+    np.testing.assert_allclose(ests[0], surface(new), atol=0.1)
+    mu = [kriging_conditional(xy, z + rng.normal(0, 1e-12, z.size), new, v)[0] for _ in range(3)]
+    for m in mu[1:]:
+        np.testing.assert_allclose(m, mu[0], atol=1e-6)
+    est, _ = ordinary_kriging(xy, z, xy[:50], v)              # still exact at the data
+    np.testing.assert_allclose(est, z[:50], atol=1e-12)
+
+
 def test_kriging_variance_grows_away_from_the_data():
     xy = np.random.default_rng(2).uniform(0, 10, size=(100, 2))
     z = xy[:, 0]
