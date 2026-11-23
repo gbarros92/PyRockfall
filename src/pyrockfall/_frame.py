@@ -177,8 +177,22 @@ def fit_polyline(x, y, tol, res, min_pts=3, max_bins=None, centreline=True, n_it
     for it in range(n_iter + 1):
         if it:
             s = _along(xc, yc, V)[0]                 # later passes: position along the polyline
-        V, bounds = _fit_once(s, xc, yc, tol, res, min_pts, max_bins, centreline)
+        V_new, b_new = _fit_once(s, xc, yc, tol, res, min_pts, max_bins, centreline)
+        bad_new = _n_folded(xc, yc, V_new)
+        if it and bad_new > bad:                     # the strip is too wide for its bends:
+            break                                    # re-binning would only diverge
+        V, bounds, bad = V_new, b_new, bad_new
     return V + o, bounds
+
+
+def _n_folded(x, y, V):
+    """Points of a strip that are NaN or ambiguous in the frame of polyline ``V``."""
+    try:
+        f = CurvilinearFrame(V)
+    except ValueError:
+        return np.inf
+    _, n_nan, n_amb = f.xyz_to_sde(np.column_stack([x, y, np.zeros_like(x)]), return_info=True)
+    return n_nan + n_amb
 
 
 def _principal_line(x, y):
@@ -268,16 +282,17 @@ class CurvilinearFrame:
     ) -> "CurvilinearFrame":
         """Fit a frame to a wall.
 
-        The polyline is fitted to the centreline of the ``steep`` points (the
-        face, without floor and berms). Without a ``steep`` mask a thin elevation
-        band around the median elevation is used instead.
+        The polyline is fitted to the centreline of a thin elevation band around
+        the median elevation of the face. With a ``steep`` mask the band is taken
+        from the ``steep`` points only, so floor and berms at that elevation are
+        left out; without one, from all the points.
 
         Parameters
         ----------
         xyz : (N, 3) array-like
             Point coordinates.
         steep : (N,) bool array, optional
-            Points that belong to the face.
+            Points that belong to the face (ignored if fewer than 1% of the points).
         tol, res, min_pts, n_iter :
             Passed to :func:`fit_polyline`.
         corner_length : {"auto", float, None}
@@ -287,7 +302,7 @@ class CurvilinearFrame:
         min_turn : float
             Bends below this angle (degrees) are not refined.
         band_fraction : float
-            Fraction of the points in the elevation band used without ``steep``.
+            Fraction of the points (of the ``steep`` ones, if given) in the elevation band.
         """
         xyz = np.asarray(xyz, float)
         if xyz.ndim != 2 or xyz.shape[1] != 3 or xyz.shape[0] < 2:
@@ -295,16 +310,20 @@ class CurvilinearFrame:
         x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
         n = xyz.shape[0]
 
-        sel = None
+        # The polyline follows the centreline of a plan-view strip, which must be thin
+        # next to the bends of the wall. The whole steep face is not: a laid-back face
+        # is as wide in plan as it is high, and binning a strip wider than the radius
+        # of a bend mixes its two legs. So the steep mask only drops floor and berms,
+        # and a thin elevation band is always taken from what is left.
+        base = np.ones(n, bool)
         if steep is not None:
             steep = np.asarray(steep, bool)
             if steep.shape == (n,) and steep.sum() >= max(2 * min_pts, 0.01 * n):
-                sel = steep
-        if sel is None:
-            lo, hi = np.quantile(z, [0.5 - 0.5 * band_fraction, 0.5 + 0.5 * band_fraction])
-            sel = (z >= lo) & (z <= hi)
-            if sel.sum() < 2 * min_pts:
-                sel = np.ones(n, bool)
+                base = steep
+        lo, hi = np.quantile(z[base], [0.5 - 0.5 * band_fraction, 0.5 + 0.5 * band_fraction])
+        sel = base & (z >= lo) & (z <= hi)
+        if sel.sum() < 2 * min_pts:
+            sel = base
 
         try:
             V, _ = fit_polyline(x[sel], y[sel], tol, res, min_pts=min_pts, n_iter=n_iter)
