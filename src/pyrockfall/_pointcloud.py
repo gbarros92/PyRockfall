@@ -17,10 +17,33 @@ except Exception:  # pragma: no cover
 ArrayF = NDArray[np.float64]
 
 from ._model import Model, _slice_positions
+from ._filesystem import openPly
 from ._geometry import Geometry
 from ._frame import CurvilinearFrame
 from ._kriging import fill_holes_uv, _class_label
 from ._utils import pcWalk, profile_from_slab
+
+def _load_ply_native(path, indices, normals: bool, colors: bool):
+    """Points (and normals, colours) of a PLY with x, y, z vertex properties, only
+    the rows `indices`. ValueError if the file cannot be read natively."""
+    v = openPly(str(path))
+    names = v.dtype.names
+    idx = None if indices is None else np.asarray(indices)
+
+    def cols(fields):
+        return np.column_stack([np.asarray(v[f] if idx is None else v[f][idx], dtype=np.float64) for f in fields])
+
+    if not all(f in names for f in ("x", "y", "z")):
+        raise ValueError(f"{path}: no x, y, z vertex properties")
+    pts = cols(("x", "y", "z"))
+    nmls = cols(("nx", "ny", "nz")) if normals and all(f in names for f in ("nx", "ny", "nz")) else None
+    rgb = None
+    if colors and all(f in names for f in ("red", "green", "blue")):
+        rgb = cols(("red", "green", "blue"))
+        if np.issubdtype(v.dtype["red"], np.integer):
+            rgb /= float(np.iinfo(v.dtype["red"]).max)
+    return pts, nmls, rgb
+
 
 class PointCloud(Model):
     """
@@ -85,28 +108,44 @@ class PointCloud(Model):
         return {"points": np.asarray(self.points)}
     
     @classmethod
-    def _load_core(cls, filename: str, **kwargs) -> "PointCloud":
+    def _load_core(cls, filename: str, indices=None, normals: bool = True, colors: bool = True,
+                   **kwargs) -> "PointCloud":
         """
         Load from file by extension:
 
+        - .ply: read natively (binary files memory-mapped, see :func:`openPly`), so
+          only the requested rows and columns are read; Open3D is the fallback for
+          PLY files the native reader does not handle
         - .npz: restores points + attrs
-        - .pcd/.ply/.xyz: via Open3D for PCD/PLY; .xyz is plain ASCII (x y z)
-        """
+        - .pcd/.pts/.las: via Open3D; .xyz is plain ASCII (x y z)
 
+        Parameters
+        ----------
+        indices : array-like of int or bool, optional
+            Only these points.
+        normals, colors : bool
+            Also load the normals (``nx, ny, nz``) / colours (``red, green, blue``,
+            as floats in [0, 1]) when the file has them. Default: True.
+        """
         path = Path(filename)
         ext = path.suffix.lower()
 
-        has_colors = False
-        has_normals = False
+        pts = cols = nmls = None
+        if ext == '.ply':
+            try:
+                pts, nmls, cols = _load_ply_native(path, indices, normals, colors)
+                indices = None                                    # already applied
+            except ValueError:
+                if not _HAS_O3D:
+                    raise
+                pts = None                                        # fall back to Open3D below
 
         if ext == '.npz':
             data = np.load(path, allow_pickle=False)
             pts = np.asarray(data["points"])
-            has_colors = 'colors' in data.files
-            has_normals = 'normals' in data.files
-            if has_colors:
+            if colors and 'colors' in data.files:
                 cols = np.asarray(data['colors'])
-            if has_normals:
+            if normals and 'normals' in data.files:
                 nmls = np.asarray(data['normals'])
 
         if ext == '.xyz':
@@ -115,26 +154,29 @@ class PointCloud(Model):
                 pts = pts[None, :]
             pts = pts[:, :3]
 
-        if ext in {'.pcd', '.ply', '.pts', '.las'}:
+        if pts is None and ext in {'.pcd', '.ply', '.pts', '.las'}:
             if not _HAS_O3D:
                 raise ValueError(f"Loading '{ext}' requires Open3D installed.")
             pc = o3d.io.read_point_cloud(str(path))
             pts = np.asarray(pc.points, dtype=np.float64)
-            if pc.has_colors():
-                has_colors = True
+            if colors and pc.has_colors():
                 cols = np.asarray(pc.colors, dtype=np.float64)
-            if pc.has_normals():
-                has_normals = True
+            if normals and pc.has_normals():
                 nmls = np.asarray(pc.normals, dtype=np.float64)
-        try:
-            obj = cls(points=pts)
-            if has_colors:
-                obj.set_attr("colors", cols)
-            if has_normals:
-                obj.set_attr("normals", nmls)
-            return obj
-        except Exception as e:
+
+        if pts is None:
             raise ValueError(f"Unsupported input extension: '{ext}'")
+        if indices is not None:
+            idx = np.asarray(indices)
+            pts = pts[idx]
+            cols = None if cols is None else cols[idx]
+            nmls = None if nmls is None else nmls[idx]
+        obj = cls(points=pts)
+        if cols is not None:
+            obj.set_attr("colors", cols)
+        if nmls is not None:
+            obj.set_attr("normals", nmls)
+        return obj
 
     # ----------------------------
     # Spatial utilities

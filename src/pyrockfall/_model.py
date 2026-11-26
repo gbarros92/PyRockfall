@@ -295,17 +295,34 @@ class Model(ABC):
         cls,
         filename: str,
         attributes: Sequence[str] | None = None,
+        *,
+        indices=None,
         **kwargs
     ) -> "Model":
         """
         1) Build a minimal instance via subclass hook.
         2) If `attributes` requested, read & attach them post-construction.
+
+        Parameters
+        ----------
+        filename : str
+        attributes : sequence of str, optional
+            Per-point properties to read, stored under these names. A name matches
+            a property exactly, else CloudCompare's ``scalar_<name>``.
+        indices : array-like of int or bool, optional
+            Load only these points (point clouds only). With a binary PLY only
+            these rows are read, so a subset of a very large cloud is cheap.
+        **kwargs
+            Passed to the subclass loader (e.g. ``normals=False, colors=False``
+            for :class:`PointCloud`).
         """
         if isinstance(attributes, str):
             attributes = [attributes]
+        if indices is not None:
+            kwargs["indices"] = indices
         obj = cls._load_core(filename, **kwargs)  # subclass returns a ready instance
         if attributes:
-            attrs = read_properties(filename, list(attributes))
+            attrs = read_properties(filename, list(attributes), indices=indices)
             obj._attrs.update(attrs)
         return obj
 

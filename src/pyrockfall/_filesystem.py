@@ -22,7 +22,6 @@ from typing import Mapping, List, Iterable, Any, Tuple
 
 import os
 import uuid
-import struct
 import numpy as np
 import pandas as pd
 from plyfile import PlyData, PlyElement
@@ -127,15 +126,12 @@ def writeMaterials(filepath: str, materials: dict[int, Material]):
     df.to_csv(filepath, index=False)
 
 
+# PLY scalar types -> numpy type codes (byte order added per file)
 _PLY_TYPEMAP = {
-    "char":   ("b", 1), "uchar":  ("B", 1),
-    "int8":   ("b", 1), "uint8":  ("B", 1),
-    "short":  ("h", 2), "ushort": ("H", 2),
-    "int16":  ("h", 2), "uint16": ("H", 2),
-    "int":    ("i", 4), "uint":   ("I", 4),
-    "int32":  ("i", 4), "uint32": ("I", 4),
-    "float":  ("f", 4), "float32":("f", 4),
-    "double": ("d", 8), "float64":("d", 8),
+    "char": "i1", "int8": "i1", "uchar": "u1", "uint8": "u1",
+    "short": "i2", "int16": "i2", "ushort": "u2", "uint16": "u2",
+    "int": "i4", "int32": "i4", "uint": "u4", "uint32": "u4",
+    "float": "f4", "float32": "f4", "double": "f8", "float64": "f8",
 }
 
 # Heuristics for grouping vectors from scalar components
@@ -173,95 +169,140 @@ def _group_components(props, base):
 
 def _parse_ply_header(f):
     """
-    Parse PLY header. Returns:
-      fmt ('ascii'|'binary_little_endian'|'binary_big_endian'),
-      vcount (int),
-      vprops (list[(name, type)]),  # only scalar properties for vertex
-      header_end_offset (int)
+    Parse a PLY header from a binary file object.
+
+    Returns:
+      fmt ('ascii' | 'binary_little_endian' | 'binary_big_endian'),
+      elements: list of (name, count, [(property, ply_type), ...], has_list_property),
+      header_end_offset (int), number of header lines (int)
     """
-    fmt = None
-    vcount = 0
-    vprops = []
-    in_vertex = False
-    header_lines = []
+    if f.readline().strip() != b"ply":
+        raise ValueError("Invalid PLY: missing 'ply' magic line")
+    fmt, elements, n_lines = None, [], 1
     while True:
         line = f.readline()
         if not line:
             raise ValueError("Invalid PLY: unexpected EOF in header")
-        try:
-            s = line.decode('utf-8').strip()
-        except UnicodeDecodeError:
-            # Some headers are pure ASCII but decoded already; fallback
-            s = line.decode(errors='ignore').strip()
-        header_lines.append(s)
-        if s.startswith("format "):
-            # e.g. 'format binary_little_endian 1.0'
-            fmt = s.split()[1]
-        elif s.startswith("element vertex"):
-            vcount = int(s.split()[-1])
-            in_vertex = True
-        elif s.startswith("element ") and not s.startswith("element vertex"):
-            in_vertex = False  # we only care about vertex properties
-        elif s.startswith("property") and in_vertex:
-            parts = s.split()
-            if parts[1] == "list":
-                # Vertex properties should not be lists; skip (faces will be lists)
-                # parts: property list <count_type> <data_type> <name>
+        n_lines += 1
+        words = line.decode("ascii", errors="replace").split()
+        if not words:
+            continue
+        if words[0] == "format":
+            fmt = words[1]
+        elif words[0] == "element":
+            elements.append((words[1], int(words[2]), [], [False]))
+        elif words[0] == "property":
+            if not elements:
+                raise ValueError("Invalid PLY: property before any element")
+            if words[1] == "list":
+                elements[-1][3][0] = True
                 continue
-            # parts: property <type> <name>
-            ptype, pname = parts[1], parts[2]
-            if ptype not in _PLY_TYPEMAP:
-                raise ValueError(f"Unsupported PLY type: {ptype}")
-            vprops.append((pname, ptype))
-        elif s == "end_header":
+            if words[1] not in _PLY_TYPEMAP:
+                raise ValueError(f"Unsupported PLY type: {words[1]}")
+            elements[-1][2].append((words[2], words[1]))
+        elif words[0] == "end_header":
             break
-    header_end_offset = f.tell()
-    if fmt is None:
-        raise ValueError("Invalid PLY header: missing format")
-    return fmt, vcount, vprops, header_end_offset
+    if fmt not in ("ascii", "binary_little_endian", "binary_big_endian"):
+        raise ValueError(f"Invalid or unsupported PLY format: {fmt}")
+    elements = [(name, count, props, has_list[0]) for name, count, props, has_list in elements]
+    return fmt, elements, f.tell(), n_lines
 
-def _read_ply_ascii(f, vcount, vprops):
-    # Read vcount lines; each line has len(vprops) tokens
-    ncols = len(vprops)
-    data = []
-    for _ in range(vcount):
-        line = f.readline()
-        if not line:
-            raise ValueError("PLY ASCII truncated")
-        vals = line.decode('utf-8').strip().split()
-        if len(vals) < ncols:
-            raise ValueError("PLY ASCII row with fewer columns than header")
-        data.append(vals[:ncols])
-    arr = np.array(data, dtype=float)
-    return arr  # shape (N, P)
 
-def _read_ply_binary(f, fmt, vcount, vprops):
-    endian = "<" if "little" in fmt else ">"
-    fmts = "".join(_PLY_TYPEMAP[t][0] for _, t in vprops)
-    row_size = sum(_PLY_TYPEMAP[t][1] for _, t in vprops)
-    struct_fmt = endian + fmts
-    # Read all vertex bytes at once
-    buf = f.read(row_size * vcount)
-    if len(buf) != row_size * vcount:
-        raise ValueError("PLY binary truncated")
-    it = struct.iter_unpack(struct_fmt, buf)
-    arr = np.fromiter((x for row in it for x in row), dtype=float, count=vcount*len(vprops))
-    arr = arr.reshape(vcount, len(vprops))
-    return arr
+def openPly(filename: str) -> np.ndarray:
+    """
+    The vertex element of a PLY file, as a structured array with one field per
+    vertex property (in the file's types).
 
-def _read_ply_all_properties(filename):
+    Binary files are memory-mapped: nothing is read until fields or rows are
+    used, and only those are read, so taking a few columns or rows of a cloud of
+    100M+ points is cheap. ASCII files are read whole.
+
+    Example
+    -------
+    >>> v = openPly("cloud.ply")
+    >>> mat = v[plyFieldName(v, "Material")]              # one column
+    >>> xyz = np.column_stack([v["x"][idx], v["y"][idx], v["z"][idx]])
+
+    Raises
+    ------
+    ValueError
+        If there is no vertex element, the vertex element has list properties, or
+        (binary) an element with list properties comes before the vertices.
+    """
     with open(filename, "rb") as f:
-        fmt, vcount, vprops, _ = _parse_ply_header(f)
-        # After header, file pointer is at first vertex row
-        if fmt == "ascii":
-            arr = _read_ply_ascii(f, vcount, vprops)
-        elif fmt in ("binary_little_endian", "binary_big_endian"):
-            arr = _read_ply_binary(f, fmt, vcount, vprops)
-        else:
-            raise ValueError(f"Unsupported PLY format: {fmt}")
-    names = [n for n, _ in vprops]
-    props = {n: arr[:, i] for i, n in enumerate(names)}
-    return props, vcount
+        fmt, elements, offset, n_lines = _parse_ply_header(f)
+    names = [e[0] for e in elements]
+    if "vertex" not in names:
+        raise ValueError(f"{filename}: no vertex element")
+    iv = names.index("vertex")
+    _, count, props, has_list = elements[iv]
+    if has_list:
+        raise ValueError(f"{filename}: list properties in the vertex element are not supported")
+    if not props:
+        raise ValueError(f"{filename}: the vertex element has no properties")
+
+    if fmt == "ascii":
+        dtype = np.dtype([(n, _PLY_TYPEMAP[t]) for n, t in props])
+        out = np.empty(count, dtype=dtype)
+        if count:
+            skip = n_lines + sum(e[1] for e in elements[:iv])
+            arr = np.loadtxt(filename, skiprows=skip, max_rows=count, usecols=range(len(props)), ndmin=2)
+            if arr.shape[0] != count:
+                raise ValueError(f"{filename}: PLY ASCII truncated")
+            for i, (n, _) in enumerate(props):
+                out[n] = arr[:, i]
+        return out
+
+    endian = "<" if fmt == "binary_little_endian" else ">"
+    for name, n, p, lst in elements[:iv]:
+        if lst:
+            raise ValueError(f"{filename}: element '{name}' with list properties comes before the vertices")
+        offset += n * np.dtype([(q, endian + _PLY_TYPEMAP[t]) for q, t in p]).itemsize
+    dtype = np.dtype([(n, endian + _PLY_TYPEMAP[t]) for n, t in props])
+    if os.path.getsize(filename) < offset + count * dtype.itemsize:
+        raise ValueError(f"{filename}: PLY binary truncated")
+    if count == 0:
+        return np.empty(0, dtype=dtype)
+    return np.memmap(filename, dtype=dtype, mode="r", offset=offset, shape=(count,))
+
+
+def plyFieldName(vertices, name: str) -> str:
+    """
+    Name of the field `name` of a PLY vertex array (see :func:`openPly`), or of
+    CloudCompare's ``scalar_<name>``.
+
+    `vertices` may also be a sequence of field names.
+    """
+    names = vertices.dtype.names if hasattr(vertices, "dtype") else tuple(vertices)
+    for cand in (name, f"scalar_{name}"):
+        if cand in names:
+            return cand
+    raise KeyError(f"No field '{name}' (or 'scalar_{name}'); available: {list(names)}")
+
+
+class _PlyFields(Mapping):
+    """Lazy name -> column mapping over a PLY vertex array, optionally restricted
+    to some rows: a column is read (and only those rows) when it is accessed."""
+
+    def __init__(self, vertices: np.ndarray, indices=None):
+        self._v = vertices
+        self._idx = None if indices is None else np.asarray(indices)
+
+    def __getitem__(self, name):
+        if name not in self._v.dtype.names:
+            raise KeyError(name)
+        col = self._v[name]
+        return col if self._idx is None else col[self._idx]
+
+    def __contains__(self, name):
+        return name in self._v.dtype.names
+
+    def __iter__(self):
+        return iter(self._v.dtype.names)
+
+    def __len__(self):
+        return len(self._v.dtype.names)
+
 
 def _from_open3d(filename, property_name):
     try:
@@ -303,13 +344,14 @@ def _from_npz(filename, property_name):
     return _resolve_property(props, property_name)
 
 def _resolve_property(props, property_name):
-    # Exact match => scalar (return 1D array)
-    for prop in props.keys():
-        if property_name in prop:
-            arr = np.asarray(props[prop])
-            if arr.ndim == 2 and arr.shape[1] in (2,3,4):  # already vector?
-                return arr, {"is_vector": True, "components": list(range(arr.shape[1]))}
-            return arr.ravel(), {"is_vector": False, "components": [property_name]}
+    # Exact name first, then CloudCompare's scalar_<name>, then any name containing it
+    names = list(props.keys())
+    exact = [n for n in (property_name, f"scalar_{property_name}") if n in props]
+    for prop in exact + [n for n in names if property_name in n and n not in exact]:
+        arr = np.asarray(props[prop])
+        if arr.ndim == 2 and arr.shape[1] in (2,3,4):  # already vector?
+            return arr, {"is_vector": True, "components": list(range(arr.shape[1]))}
+        return arr.ravel(), {"is_vector": False, "components": [property_name]}
 
     # Try to assemble a vector from components
     vec, comps = _group_components(props, property_name)
@@ -322,53 +364,72 @@ def _resolve_property(props, property_name):
         return vec, {"is_vector": True, "components": ["x","y","z"]}
 
     raise KeyError(f"Property '{property_name}' not found (and no matching components). "
-                   f"Available: {sorted(props.keys())[:20]}{'...' if len(props)>20 else ''}")
+                   f"Available: {sorted(names)[:20]}{'...' if len(names)>20 else ''}")
+
+
+def _subset(data: np.ndarray, indices) -> np.ndarray:
+    return data if indices is None else np.asarray(data)[np.asarray(indices)]
+
 
 def read_property(
     filename: str,
     property_name: str,
+    indices=None,
 ):
     """
     Read a scalar or vector property from a point set file.
 
     Supported:
-      - .ply (ASCII, binary little-endian, binary big-endian) [native]
+      - .ply (ASCII, binary little-endian, binary big-endian) [native, see :func:`openPly`]
       - .npz (keys become properties) [native]
-      - .pcd, .xyz (and .ply fallback) via lazy Open3D if available
+      - .pcd, .xyz (and other formats) via lazy Open3D if available
+
+    Names are matched exactly first, then as CloudCompare's ``scalar_<name>``,
+    then as any property containing the name.
 
     Vector auto-detection:
       - exact groups: xyz, normal(n: nx,ny,nz or normal_x,...) ; rgb/rgba ; uv
       - generic: <name>_{x,y,z} or <name>{x,y,z}
 
+    Parameters
+    ----------
+    indices : array-like of int or bool, optional
+        Only these points (rows). With a binary PLY only those rows are read.
+
     Returns
     -------
     data : np.ndarray
-        (N,) for scalar or (N, k) for vectors.
+        (N,) for scalar or (N, k) for vectors; float64 for PLY files.
     meta : dict
         {"is_vector": bool, "components": [names...]}
     """
     ext = os.path.splitext(filename)[1].lower()
     if ext == ".ply":
-        props, _ = _read_ply_all_properties(filename)
-        return _resolve_property(props, property_name)
+        data, meta = _resolve_property(_PlyFields(openPly(filename), indices), property_name)
+        return np.asarray(data, dtype=np.float64), meta
     elif ext == ".npz":
-        return _from_npz(filename, property_name)
+        data, meta = _from_npz(filename, property_name)
+        return _subset(data, indices), meta
     elif ext in (".pcd", ".xyz"):
-        return _from_open3d(filename, property_name)
+        data, meta = _from_open3d(filename, property_name)
+        return _subset(data, indices), meta
     else:
         # Try Open3D for other common point formats; will still allow xyz/normals/colors if present
         try:
-            return _from_open3d(filename, property_name)
+            data, meta = _from_open3d(filename, property_name)
         except Exception as e:
             raise ValueError(f"Unsupported extension '{ext}' and Open3D fallback failed: {e}") from e
+        return _subset(data, indices), meta
 
-def read_properties(filename: str, required: list[str]) -> dict[str, np.ndarray]:
+def read_properties(filename: str, required: list[str], indices=None) -> dict[str, np.ndarray]:
     """
     Read properties from a geometry file and return them.
 
     Args:
         filename: Path to the file (.npz, .ply, .pcd, .xyz, .obj, .stl, .off).
         required: List of attributes to read (e.g. ["points", "normals"]).
+        indices: Only these points (rows), optional. With a binary PLY only those
+            rows of the requested properties are read.
 
     Returns:
         dict[str, np.ndarray]: Mapping from attribute name to array.
@@ -379,10 +440,14 @@ def read_properties(filename: str, required: list[str]) -> dict[str, np.ndarray]
     """
     if not os.path.exists(filename):
         raise FileNotFoundError(f"File '{filename}' not found.")
-    
-    attrs: dict[str, np.ndarray] = {}        
+
+    if os.path.splitext(filename)[1].lower() == ".ply":
+        fields = _PlyFields(openPly(filename), indices)          # header parsed once
+        return {key: np.asarray(_resolve_property(fields, key)[0], dtype=np.float64) for key in required}
+
+    attrs: dict[str, np.ndarray] = {}
     for key in required:
-        data, meta = read_property(filename, key)
+        data, meta = read_property(filename, key, indices)
         attrs[key] = np.asarray(data)
 
     return attrs
@@ -676,7 +741,9 @@ def importSeeders(filepath: str, rockTypes: List[Rock]) -> List[Seeder]:
     mkdist  = lambda s: (p:=s.split()) and stats.makeDistribution(stats.DistributionParameters.relative(
                     id=int(float(p[0])), loc=float(p[1]), scale=float(p[2]), rel_min=float(p[3]), rel_max=float(p[4])
                 )) or (_ for _ in ()).throw(ValueError(f"Bad dist line: {s!r}"))
-    out, ln = [], [l.strip() for l in open(filepath, "r", encoding="utf-8") if l.strip()]
+    with open(filepath, "r", encoding="utf-8") as fh:
+        ln = [l.strip() for l in fh if l.strip()]
+    out = []
     i = 0
     while i < len(ln):
         m, n = ln[i].split()[:2]; i += 1

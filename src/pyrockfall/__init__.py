@@ -29,6 +29,7 @@ from ._filesystem import (
     exportRocks, importRocks,  # export/import rock definitions .ini files
     exportSeeders, importSeeders,  # export/import seeder properties .txt files
     exportSettings, importSettings,  # export/import project settings .ini files
+    openPly, plyFieldName,  # PLY vertices as a (memory-mapped) structured array
 )
 from . import stats
 

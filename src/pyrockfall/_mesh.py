@@ -273,6 +273,8 @@ class Mesh(Model):
         Returns:
             Mesh: A new mesh with geometry loaded.
         """
+        if kwargs.get("indices") is not None:
+            raise ValueError("Mesh.load does not take `indices`: a subset of the vertices breaks the triangles.")
         path = str(filename)
         low = path.lower()
 

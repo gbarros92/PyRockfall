@@ -407,6 +407,133 @@ def test_write_ply_with_colors_roundtrip(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# openPly / plyFieldName and row subsets (native PLY reader)
+# ---------------------------------------------------------------------------
+
+def _write_raw_ply(path, fmt, columns, types, pre_element=None):
+    """A vertex-only PLY (optionally after another fixed-size element) written by
+    hand, so the reader is not tested against its own writer."""
+    names = list(columns)
+    n = len(columns[names[0]])
+    header = ["ply", f"format {fmt} 1.0"]
+    if pre_element is not None:
+        header += [f"element camera {len(pre_element)}", "property float view"]
+    header += [f"element vertex {n}"] + [f"property {types[k]} {k}" for k in names] + ["end_header"]
+    np_types = {"float": "f4", "double": "f8", "uchar": "u1", "int": "i4"}
+    with open(path, "wb") as f:
+        f.write(("\n".join(header) + "\n").encode("ascii"))
+        if fmt == "ascii":
+            if pre_element is not None:
+                for v in pre_element:
+                    f.write(f"{v}\n".encode())
+            for i in range(n):
+                f.write((" ".join(str(columns[k][i]) for k in names) + "\n").encode())
+        else:
+            e = "<" if fmt == "binary_little_endian" else ">"
+            if pre_element is not None:
+                f.write(np.asarray(pre_element, dtype=e + "f4").tobytes())
+            rec = np.empty(n, dtype=[(k, e + np_types[types[k]]) for k in names])
+            for k in names:
+                rec[k] = columns[k]
+            f.write(rec.tobytes())
+
+
+_COLS = {
+    "x": [0.0, 1.0, 2.0, 3.0], "y": [10.0, 11.0, 12.0, 13.0], "z": [-1.0, -2.0, -3.0, -4.0],
+    "nx": [0.0, 0.0, 1.0, 0.0], "ny": [0.0, 1.0, 0.0, 0.0], "nz": [1.0, 0.0, 0.0, 1.0],
+    "red": [255, 0, 0, 51], "green": [0, 255, 0, 51], "blue": [0, 0, 255, 51],
+    "scalar_Material": [3.0, 7.0, 7.0, 0.0],
+}
+_TYPES = {"x": "double", "y": "double", "z": "double", "nx": "float", "ny": "float", "nz": "float",
+          "red": "uchar", "green": "uchar", "blue": "uchar", "scalar_Material": "float"}
+
+
+@pytest.mark.parametrize("fmt", ["binary_little_endian", "binary_big_endian", "ascii"])
+@pytest.mark.parametrize("pre", [None, [1.5, 2.5]])
+def test_openPly_reads_vertices(tmp_path, fmt, pre):
+    path = tmp_path / "cloud.ply"
+    _write_raw_ply(path, fmt, _COLS, _TYPES, pre_element=pre)
+    v = pr.openPly(str(path))
+    assert v.shape == (4,)
+    assert v.dtype.names == tuple(_COLS)
+    for k, vals in _COLS.items():
+        np.testing.assert_allclose(v[k], vals)
+    if fmt != "ascii":
+        assert isinstance(v, np.memmap)
+
+
+def test_plyFieldName_exact_then_cloudcompare_prefix(tmp_path):
+    path = tmp_path / "cloud.ply"
+    _write_raw_ply(path, "binary_little_endian", _COLS, _TYPES)
+    v = pr.openPly(str(path))
+    assert pr.plyFieldName(v, "Material") == "scalar_Material"
+    assert pr.plyFieldName(v, "x") == "x"
+    assert pr.plyFieldName(v.dtype.names, "red") == "red"
+    with pytest.raises(KeyError):
+        pr.plyFieldName(v, "Profile")
+
+
+def test_openPly_rejects_truncated_and_non_ply(tmp_path):
+    path = tmp_path / "cloud.ply"
+    _write_raw_ply(path, "binary_little_endian", _COLS, _TYPES)
+    data = path.read_bytes()
+    (tmp_path / "short.ply").write_bytes(data[:-3])
+    with pytest.raises(ValueError, match="truncated"):
+        pr.openPly(str(tmp_path / "short.ply"))
+    (tmp_path / "bad.ply").write_bytes(b"not a ply\n")
+    with pytest.raises(ValueError):
+        pr.openPly(str(tmp_path / "bad.ply"))
+
+
+def test_read_property_prefers_exact_name(tmp_path):
+    """'Material' must not resolve to 'Material_P1', whichever comes first."""
+    from pyrockfall._filesystem import read_property, read_properties
+    cols = {"x": [0.0, 1.0], "y": [0.0, 1.0], "z": [0.0, 1.0],
+            "Material_P1": [0.25, 0.5], "Material": [4.0, 5.0]}
+    types = {k: "float" for k in cols}
+    path = tmp_path / "filled.ply"
+    _write_raw_ply(path, "binary_little_endian", cols, types)
+    val, _ = read_property(str(path), "Material")
+    np.testing.assert_allclose(val, [4.0, 5.0])
+    out = read_properties(str(path), ["Material", "Material_P1"])
+    np.testing.assert_allclose(out["Material_P1"], [0.25, 0.5])
+    assert out["Material"].dtype == np.float64
+
+
+def test_read_properties_subset_of_rows(tmp_path):
+    from pyrockfall._filesystem import read_properties
+    path = tmp_path / "cloud.ply"
+    _write_raw_ply(path, "binary_little_endian", _COLS, _TYPES)
+    out = read_properties(str(path), ["Material", "xyz"], indices=[3, 1])
+    np.testing.assert_allclose(out["Material"], [0.0, 7.0])
+    np.testing.assert_allclose(out["xyz"], [[3.0, 13.0, -4.0], [1.0, 11.0, -2.0]])
+    mask = np.array([False, True, True, False])
+    np.testing.assert_allclose(read_properties(str(path), ["Material"], indices=mask)["Material"], [7.0, 7.0])
+
+
+def test_pointcloud_load_ply_native(tmp_path):
+    path = tmp_path / "cloud.ply"
+    _write_raw_ply(path, "binary_little_endian", _COLS, _TYPES)
+    pc = pr.PointCloud.load(str(path), attributes=["Material"])
+    np.testing.assert_allclose(pc.points, np.column_stack([_COLS["x"], _COLS["y"], _COLS["z"]]))
+    np.testing.assert_allclose(pc.get_attr("normals"), np.column_stack([_COLS["nx"], _COLS["ny"], _COLS["nz"]]))
+    np.testing.assert_allclose(pc.get_attr("colors")[3], [0.2, 0.2, 0.2])      # uchar / 255
+    np.testing.assert_allclose(pc.get_attr("Material"), _COLS["scalar_Material"])
+
+    sub = pr.PointCloud.load(str(path), attributes=["Material"], indices=[0, 2], normals=False, colors=False)
+    np.testing.assert_allclose(sub.points, [[0.0, 10.0, -1.0], [2.0, 12.0, -3.0]])
+    np.testing.assert_allclose(sub.get_attr("Material"), [3.0, 7.0])
+    assert not sub.has_attr("normals") and not sub.has_attr("colors")
+
+
+def test_mesh_load_rejects_indices(tmp_path):
+    path = tmp_path / "cloud.ply"
+    _write_raw_ply(path, "binary_little_endian", _COLS, _TYPES)
+    with pytest.raises(ValueError, match="indices"):
+        pr.Mesh.load(str(path), indices=[0, 1])
+
+
+# ---------------------------------------------------------------------------
 # write_xyz_ascii / write_pcd_minimal (via Open3D-backed read_property)
 # ---------------------------------------------------------------------------
 
