@@ -3,7 +3,7 @@ from scipy.stats import norm
 from typing import Callable, Optional, Tuple, Union, Sequence
 from numpy.typing import NDArray
 
-from ._utils import build_neighbours_polygon, brentq
+from ._utils import build_neighbours_polygon, brentq, dampedMotion
 
 class Geometry:
     def __init__(
@@ -540,12 +540,19 @@ class Geometry:
         *,
         samples: Optional[np.ndarray] = None,    # (2, M, 1) or (2, M, S)
         tol: float = 1e-12,
+        root: str = "entering",
     ) -> np.ndarray:
         """
         Candidate parabola/polyline support-line intersection times.
 
-        Returns a matrix with shape (M-1, S). Entries are np.inf where the
-        parabola has no finite intersection with the segment's supporting line.
+        `root` picks one of the two crossings of each support line:
+        "entering" (default) the one entering the side opposite the element
+        normal (a landing on a slope whose normal points to the air), "min"
+        the earlier and "max" the later crossing.
+
+        Returns a matrix with shape (E, S), one row per element (for the default
+        polyline E = M-1). Entries are np.inf where the parabola has no finite
+        intersection with the segment's supporting line.
         Use feasibleImpactTime to filter by segment bounds and choose one hit
         per sample.
         """
@@ -557,8 +564,10 @@ class Geometry:
         S = p.shape[1]
 
         pts = self.getSamples(samples, S=S)  # (2, M, S)
-        A = pts[:, :-1, :]               # (2, M-1, S)
-        B = pts[:,  1:, :]               # (2, M-1, S)
+        # One row per element (its two nodes), so ids are element ids for any
+        # connectivity; for the default polyline these are nodes i and i+1.
+        A = pts[:, self._elements[:, 0], :]   # (2, E, S)
+        B = pts[:, self._elements[:, 1], :]   # (2, E, S)
         E = B - A                        # (2, M-1, S)
         len2 = np.sum(E * E, axis=0)     # (M-1, S)
         valid_seg = len2 > tol
@@ -594,8 +603,13 @@ class Geometry:
                 t2_vals = (-Bq + sdisc) / (2.0 * Aq)
                 t_min_root = np.minimum(t1_vals, t2_vals)
                 t_max_root = np.maximum(t1_vals, t2_vals)
-                # Where element's normal points up get t_max
-                t_root = np.where(Ny >= 0, t_max_root, t_min_root)
+                if root == "min":
+                    t_root = t_min_root
+                elif root == "max":
+                    t_root = t_max_root
+                else:
+                    # Where element's normal points up get t_max
+                    t_root = np.where(Ny >= 0, t_max_root, t_min_root)
                 t_root[~ok] = np.inf
                 t[mask_quad] = t_root
 
@@ -645,12 +659,12 @@ class Geometry:
         if p.shape != v.shape or p.shape != a.shape or p.ndim != 2 or p.shape[0] != 2:
             raise ValueError("`p`, `v`, `a` must each be shape (2, S) with matching S.")
         if t.ndim != 2 or t.shape[1] != p.shape[1]:
-            raise ValueError("`t` must have shape (M-1, S).")
+            raise ValueError("`t` must have shape (E, S).")
 
         S = p.shape[1]
         pts = self.getSamples(samples, S=S)  # (2, M, S)
-        A = pts[:, :-1, :]                   # (2, M-1, S)
-        B = pts[:,  1:, :]                   # (2, M-1, S)
+        A = pts[:, self._elements[:, 0], :]  # (2, E, S), one row per element
+        B = pts[:, self._elements[:, 1], :]  # (2, E, S)
         E = B - A                            # (2, M-1, S)
         len2 = np.sum(E * E, axis=0)         # (M-1, S)
         valid_seg = len2 > tol
@@ -772,13 +786,32 @@ class Geometry:
         t_min: float = 0.0,
         t_max: float = np.inf,
         tol: float = 1e-12,
+        crossing: str = "entering",
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Vectorised 2D intersection between parabolic trajectories and a polyline.
 
+        `crossing` is "entering" (default: only crossings into the side
+        opposite the element normals, i.e. landings on a slope) or "any"
+        (the first crossing in either direction, e.g. a canopy line crossed
+        on the way in or out).
+
         Returns (seg_id, t) with shapes (S,), (S,). seg_id=-1 and t is
         non-finite for no hit.
         """
+        if crossing == "any":
+            hits = [
+                self.feasibleImpactTime(
+                    self.intersectParabolaMatrix(p, v, a, elem_id, samples=samples, tol=tol, root=which),
+                    p, v, a, samples=samples, t_min=t_min, t_max=t_max, tol=tol,
+                )
+                for which in ("min", "max")
+            ]
+            (s1, t1), (s2, t2) = hits
+            use2 = np.isfinite(t2) & (~np.isfinite(t1) | (t2 < t1))
+            return np.where(use2, s2, s1), np.where(use2, t2, t1)
+        if crossing != "entering":
+            raise ValueError("crossing must be 'entering' or 'any'")
         t = self.intersectParabolaMatrix(
             p,
             v,
@@ -858,8 +891,8 @@ class Geometry:
             raise ValueError("`damping` must be positive for damped motion.")
 
         pts = self.getSamples(samples, S=S)  # (2, M, S)
-        A = pts[:, :-1, :]                   # (2, M-1, S)
-        B = pts[:,  1:, :]                   # (2, M-1, S)
+        A = pts[:, self._elements[:, 0], :]  # (2, E, S), one row per element
+        B = pts[:, self._elements[:, 1], :]  # (2, E, S)
         E = B - A                            # (2, M-1, S)
 
         len2 = np.sum(E * E, axis=0)          # (M-1, S)
@@ -872,18 +905,14 @@ class Geometry:
             t shape: (M-1, S)
             returns X shape: (2, M-1, S)
             """
-            tt = t[None, :, :]                      # (1, M-1, S)
-            Dv = D[None, None, :]
-            e = np.exp(-Dv * tt)
+            disp, _ = dampedMotion(v[:, None, :], a[:, None, :], D[None, None, :], t[None, :, :])
+            return p[:, None, :] + disp
 
-            drift = a[:, None, :] / Dv
-            transient = (v[:, None, :] - drift) / Dv
-
-            return p[:, None, :] + drift * tt + transient * (1.0 - e)
-
-        # Segment-line residual
-        nx = -E[1]                                  # (M-1, S)
-        ny =  E[0]                                  # (M-1, S)
+        # Segment-line residual: signed distance to the support line, so
+        # that `tol` is a length whatever the element length.
+        L = np.sqrt(np.where(valid_seg, len2, 1.0))
+        nx = -E[1] / L                              # (M-1, S)
+        ny =  E[0] / L                              # (M-1, S)
 
         def f_mat(t: np.ndarray) -> np.ndarray:
             X = r_damped(t)
@@ -927,10 +956,38 @@ class Geometry:
 
         # ------------------------------------------------------------------
         # Bracket construction
+        #
+        # f(t) = n·(r(t) - A) has f'(t) = n·v(t) = (n·v0 - c) exp(-D t) + c,
+        # with c = n·a / D: f' is monotonic, so f has at most one turning
+        # point t*, where exp(-D t*) = -c / (n·v0 - c). f is monotonic on
+        # each side of t*, so each side holds at most one crossing: search
+        # [t_min, t*] first, then beyond t*. (A single bracket from t_min to
+        # the parabola's crossing time can hold two crossings, e.g. up into
+        # and back down out of a canopy line, and then finds neither.)
         # ------------------------------------------------------------------
-        t_l = np.full(shape, t_min, dtype=float)
-        t_u = t_l + t_step
+        nv = nx * v[0][None, :] + ny * v[1][None, :]
+        na = nx * a[0][None, :] + ny * a[1][None, :]
+        Dm = D[None, :]
+        c = na / Dm
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = -c / (nv - c)
+            t_turn = np.where((ratio > 0.0) & (ratio < 1.0), -np.log(ratio) / Dm, np.inf)
 
+        def slope_at(t: np.ndarray) -> np.ndarray:
+            return (nv - c) * np.exp(-Dm * t) + c
+
+        t_l = np.full(shape, t_min, dtype=float)
+        # A trajectory starting on a support line (the element it leaves, or
+        # a canopy line it just crossed) has a root at t_min that is not a
+        # crossing: start the search just after it, so the next crossing of
+        # that line is found instead of t_min.
+        on_line = np.abs(f_mat(t_l)) <= tol
+        start_shift = np.maximum(1e-6 * t_step, 10.0 * tol)
+        t_l = np.where(on_line, t_l + start_shift, t_l)
+        t_l0 = t_l.copy()
+
+        first = np.isfinite(t_turn) & (t_turn > t_l0)
+        t_u = np.where(first, t_turn, t_l + t_step)
         if np.isfinite(t_max):
             t_u = np.minimum(t_u, t_max)
 
@@ -939,17 +996,40 @@ class Geometry:
 
         active = valid_seg & np.isfinite(f_l) & np.isfinite(f_u)
 
-        # Exact roots at lower/upper bounds
-        root_at_l = active & (np.abs(f_l) <= tol)
-        root_at_u = active & (np.abs(f_u) <= tol)
+        def flags():
+            # exact roots at the bounds (not the shifted start) and brackets
+            r_l = active & (np.abs(f_l) <= tol) & ~(on_line & (t_l == t_l0))
+            r_u = active & (np.abs(f_u) <= tol)
+            return r_l, r_u, active & (f_l * f_u < 0.0)
 
-        bracketed = active & (f_l * f_u < 0.0)
+        root_at_l, root_at_u, bracketed = flags()
+
+        # No crossing before the turning point: search beyond it
+        skip = active & first & ~root_at_l & ~root_at_u & ~bracketed
+        if np.isfinite(t_max):
+            skip &= t_u < t_max
+        if np.any(skip):
+            t_l = np.where(skip, t_u, t_l)
+            f_l = np.where(skip, f_u, f_l)
+            t_u_new = t_u + t_step
+            if np.isfinite(t_max):
+                t_u_new = np.minimum(t_u_new, t_max)
+            t_u = np.where(skip, t_u_new, t_u)
+            f_u = np.where(skip, f_mat(t_u), f_u)
+            root_at_l, root_at_u, bracketed = flags()
 
         for _ in range(max_expand):
             bad = active & ~root_at_l & ~root_at_u & ~bracketed
 
             if np.isfinite(t_max):
                 bad &= t_u < t_max
+
+            # f is monotonic from t_u on; moving away from zero, it never
+            # crosses: stop searching
+            away = bad & (f_u * slope_at(t_u) > 0.0)
+            if np.any(away):
+                active = active & ~away
+                bad &= ~away
 
             if not np.any(bad):
                 break
@@ -966,9 +1046,7 @@ class Geometry:
             t_u = np.where(bad, t_u_new, t_u)
             f_u = np.where(bad, f_mat(t_u), f_u)
 
-            root_at_l = active & (np.abs(f_l) <= tol)
-            root_at_u = active & (np.abs(f_u) <= tol)
-            bracketed = active & (f_l * f_u < 0.0)
+            root_at_l, root_at_u, bracketed = flags()
 
         # ------------------------------------------------------------------
         # Brent solve

@@ -52,6 +52,7 @@ from ._utils import (
     getSubSamples,
     setSubSamples,
     scatterSubSamples,
+    dampedMotion,
 )
 
 class Sampling(Enum):
@@ -579,13 +580,72 @@ class Analysis:
         # Static friction threshold
         mu_s = np.tan(np.radians(phi))               # (1,S)
 
-        # Start sliding if required tangential > mu_s * N
-        start_sliding = at_norm > mu_s * N_over_m    # (1,S) bool
+        # Start sliding if the net tangential acceleration (gravity beyond
+        # mu_s * N) gains more than the stopped velocity in one step. Below
+        # that, _slide zeroes the speed it gains and the block never moves,
+        # so it must count as stopped or the run cycles until maxIter.
+        start_sliding = (at_norm - mu_s * N_over_m) * self.timeStep > self.stoppedVelocity  # (1,S) bool
 
         # Stick–slip decision (elementwise)
         is_sliding = ~is_stopped | (is_stopped & start_sliding)  # (1,S)
 
         return is_sliding  # return as (S,)
+
+    def _isTrapped(
+        self,
+        pos: np.ndarray,       # (D,S) positions on the elements
+        vel: np.ndarray,       # (D,S) velocities
+        elem_id: np.ndarray,   # (S,) current elements
+        profiles: np.ndarray,  # (D,M,1) or (D,M,S) node samples
+    ) -> np.ndarray:
+        """
+        (S,) True for slow blocks resting on a node lower than both of its
+        neighbours (the bottom of a V-notch).
+
+        Gravity pulls such a block back to the node from either element, so
+        when both walls are steeper than the friction angle the slide step
+        bounces it between them in zero time and it never stops. Only 2D
+        polylines are handled; other blocks are reported as not trapped.
+        """
+        S = pos.shape[1]
+        trapped = np.zeros(S, dtype=bool)
+        if self._ndim != 2 or S == 0:
+            return trapped
+        speed = np.linalg.norm(vel, axis=0)
+        cand = speed < self.normalVelocityThreshold
+        if not np.any(cand):
+            return trapped
+
+        elems = np.asarray(self.slope.elements, dtype=int)
+        pts = self.slope.getSamples(profiles, S=S)                 # (2,M,S)
+        ar = np.arange(S)
+        i_idx = elems[elem_id, 0]
+        j_idx = elems[elem_id, 1]
+        Pi = pts[:, i_idx, ar]
+        Pj = pts[:, j_idx, ar]
+        di = np.linalg.norm(pos - Pi, axis=0)
+        dj = np.linalg.norm(pos - Pj, axis=0)
+        at_j = dj <= di
+        node = np.where(at_j, j_idx, i_idx)
+        other = np.where(at_j, i_idx, j_idx)
+        dist = np.where(at_j, dj, di)
+        L = np.linalg.norm(Pj - Pi, axis=0)
+        cand &= dist <= np.maximum(self.tolerance, 1e-9 * L)
+
+        # The neighbouring element across that node (elem±1 for a polyline)
+        nb = np.where(at_j, elem_id + 1, elem_id - 1)
+        ok = (nb >= 0) & (nb < elems.shape[0])
+        nb_c = np.clip(nb, 0, elems.shape[0] - 1)
+        a, b = elems[nb_c, 0], elems[nb_c, 1]
+        ok &= (a == node) | (b == node)
+        cand &= ok
+        if not np.any(cand):
+            return trapped
+        nb_other = np.where(a == node, b, a)
+
+        y_node = pts[-1, node, ar]
+        trapped = cand & (pts[-1, other, ar] > y_node) & (pts[-1, nb_other, ar] > y_node)
+        return trapped
 
     def _slide(
         self,
@@ -702,12 +762,16 @@ class Analysis:
             samples=profiles,
             tol=self.tolerance
         )
-        gone_to_new = (alpha < 1.0) & (alpha > 0.0)
+        # alpha == 0 means the block already sits on the end node it moves
+        # towards: it must change element now, or it slides on along the
+        # element's extension (into the rock at a V-notch, into the air at a
+        # convex corner) and never leaves it.
+        gone_to_new = (alpha < 1.0) & (alpha >= 0.0)
         new_element_id[~gone_to_new] = elem_id[~gone_to_new]
         if np.any(gone_to_new):
             alpha = alpha[gone_to_new]
             pos_new[:, gone_to_new] = pos[:, gone_to_new] + disp[:, gone_to_new] * alpha
-            vt_new[:, gone_to_new] = vt_new[:, gone_to_new] + (vt_new[:, gone_to_new] - vt[:, gone_to_new]) * alpha
+            vt_new[:, gone_to_new] = vt[:, gone_to_new] + (vt_new[:, gone_to_new] - vt[:, gone_to_new]) * alpha
             dt[gone_to_new] *= alpha
 
         # Zero-out tiny residual tangential velocity for sticking samples
@@ -724,6 +788,43 @@ class Analysis:
         is_falling = (vn > self.normalVelocityThreshold) | (normals[-1] <= 0.0)
         return is_falling
 
+    def _canopyEntering(
+        self,
+        velocity: np.ndarray,   # (2,S) velocity at the crossing
+        segment: np.ndarray,    # (S,) canopy segment crossed
+        canopy: np.ndarray,     # (2,M,1) or (2,M,S) canopy node samples
+        inside: np.ndarray,     # (S,) bool, in vegetation before the crossing
+    ) -> np.ndarray:
+        """
+        (S,) True where crossing the canopy line takes the block into the
+        vegetation: it crosses downwards, against the segment normal turned
+        to point up. On a vertical segment the state just toggles.
+        """
+        S = velocity.shape[1]
+        elems = np.asarray(self.vegetation.elements, dtype=int)
+        pts = self.vegetation.getSamples(canopy, S=S)
+        ar = np.arange(S)
+        E = pts[:, elems[segment, 1], ar] - pts[:, elems[segment, 0], ar]   # (2,S)
+        n = np.array([-E[1], E[0]])
+        n *= np.where(n[1] < 0.0, -1.0, 1.0)[None, :]
+        vn = np.sum(velocity * n, axis=0)
+        vertical = np.abs(n[1]) <= 1e-12 * np.linalg.norm(E, axis=0)
+        return np.where(vertical, ~inside, vn < 0.0)
+
+    def _canopyAbove(
+        self,
+        position: np.ndarray,   # (2,S)
+        canopy: np.ndarray,     # (2,M,1) or (2,M,S)
+    ) -> np.ndarray:
+        """(S,) the canopy segment right above each position, or -1."""
+        seg, _ = self.vegetation.verticalProjection(
+            position,
+            np.full(position.shape[1], -1, dtype=int),
+            direction=1,
+            samples=canopy,
+        )
+        return np.asarray(seg, dtype=int)
+
     def _fall(
         self,
         position: np.ndarray,
@@ -734,7 +835,21 @@ class Analysis:
         canopy: Optional[np.ndarray] = None,
         drag_params: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Update ballistic blocks. Returns (position, velocity, dt)."""                
+        """
+        Advance falling blocks to their next contact. Returns (position,
+        velocity, dt, element_id, segment_id).
+
+        A block outside the vegetation (segment_id < 0) follows a parabola
+        to whichever comes first: the slope, or a canopy line. A block in
+        the vegetation (segment_id >= 0: the canopy segment above it, whose
+        drag applies) follows the damped trajectory to the slope or to a
+        canopy line. Crossing a canopy line downwards enters the vegetation
+        and upwards leaves it; either way the block is in the air
+        afterwards (element_id = -1), so the next step does not treat the
+        crossing as an impact on the element it left. Whether a block
+        leaving the slope starts in the vegetation is set by the caller
+        (_canopyAbove).
+        """
         g = np.zeros_like(velocity)
         g[-1, :] = self.gravity
         elapsed_time = np.full(position.shape[1], np.nan, dtype=float)
@@ -770,6 +885,7 @@ class Analysis:
                     seg,
                     samples=can,
                     tol=self.tolerance,
+                    crossing="any",
                 )
                 good_seg = np.isfinite(dt_seg) & (np.abs(dt_seg) > 0.0)
 
@@ -781,17 +897,16 @@ class Analysis:
                 dt[hit_seg] = dt_seg[hit_seg]
 
                 good = hit_elm | hit_seg
-
-                seg_out = seg.copy()
-                seg_out[hit_seg] = seg2[hit_seg]
             else:
-                good = np.isfinite(dt_elm) & (np.abs(dt_elm) > 0.0)
+                good = good_elm
                 hit_elm = good_elm
+                hit_seg = np.zeros_like(good)
                 dt = dt_elm
-                seg_out = seg
 
             elm_out = elm.copy()
             elm_out[hit_elm] = elm2[hit_elm]
+            elm_out[hit_seg] = -1
+            seg_out = seg.copy()
 
             no_hit = ~good
             if np.any(no_hit):
@@ -809,6 +924,10 @@ class Analysis:
             if np.any(good):
                 pos[:, good] += vel[:, good] * dt[good] + 0.5 * acc[:, good] * dt[good]**2
                 vel[:, good] += acc[:, good] * dt[good]
+            if np.any(hit_seg):
+                can_h = can if can.shape[-1] == 1 else can[..., hit_seg]
+                enter = self._canopyEntering(vel[:, hit_seg], seg2[hit_seg], can_h, np.zeros(hit_seg.sum(), dtype=bool))
+                seg_out[hit_seg] = np.where(enter, seg2[hit_seg], -1)
             elapsed_time[no_vegetation] = dt
             setSubSamples(
                 no_vegetation,
@@ -848,7 +967,6 @@ class Analysis:
                 seg,
                 samples=can,
                 tol=self.tolerance,
-                t_min=self.tolerance
             )
             good_elm = np.isfinite(dt_elm) & (np.abs(dt_elm) > 0.0)
             good_seg = np.isfinite(dt_seg) & (np.abs(dt_seg) > 0.0)
@@ -862,21 +980,19 @@ class Analysis:
 
             good = hit_elm | hit_seg
             if np.any(good):
-                d = drag[good]  # or damping[good]
-                t = dt[good]
-                e = np.exp(-d * t)
-
-                a_d = acc[:, good] / d[None, :]
-                v0_minus_ad = vel[:, good] - a_d
-
-                pos[:, good] += a_d * t[None, :] + v0_minus_ad / d[None, :] * (1.0 - e)[None, :]
-                vel[:, good] = a_d + v0_minus_ad * e[None, :]
+                disp, vel_new = dampedMotion(vel[:, good], acc[:, good], drag[good][None, :], dt[good][None, :])
+                pos[:, good] += disp
+                vel[:, good] = vel_new
 
             elapsed_time[in_vegetation] = dt
             elm_out = elm.copy()
             seg_out = seg.copy()
             elm_out[hit_elm] = elm2[hit_elm]
-            seg_out[hit_seg] = seg2[hit_seg]
+            elm_out[hit_seg] = -1
+            if np.any(hit_seg):
+                can_h = can if can.shape[-1] == 1 else can[..., hit_seg]
+                enter = self._canopyEntering(vel[:, hit_seg], seg2[hit_seg], can_h, np.ones(hit_seg.sum(), dtype=bool))
+                seg_out[hit_seg] = np.where(enter, seg2[hit_seg], -1)
             setSubSamples(
                 in_vegetation,
                 (pos, vel, elm_out, seg_out),
@@ -1036,6 +1152,19 @@ class Analysis:
                     vt_low, normal_low, phi_low = getSubSamples(is_low, vt_on_el, normal_on_el, mp_on_el[2])
                     setSubSamples(is_low, (self._isSliding(vt_low, normal_low, phi_low),), is_sliding_on_el)
 
+                # blocks at the bottom of a V-notch stay there
+                if np.any(is_sliding_on_el):
+                    trapped = np.zeros_like(is_sliding_on_el)
+                    vel_s = vt_on_el[:, is_sliding_on_el] + normal_on_el[:, is_sliding_on_el] * vn_on_el[is_sliding_on_el]
+                    trapped[is_sliding_on_el] = self._isTrapped(
+                        pos_on_el[:, is_sliding_on_el], vel_s,
+                        id_on_el[is_sliding_on_el], pro_on_el[:, :, is_sliding_on_el] if pro_on_el.shape[-1] > 1 else pro_on_el,
+                    )
+                    if np.any(trapped):
+                        is_sliding_on_el &= ~trapped
+                        vt_on_el[:, trapped] = 0.0
+                        vn_on_el[trapped] = 0.0
+
                 # slide update (apply only to sliding blocks by slicing inputs)
                 if np.any(is_sliding_on_el):
                     pos_s, vt_s, t_s, normal_s, phi_s, pro_s, id_s = getSubSamples(is_sliding_on_el,
@@ -1065,6 +1194,14 @@ class Analysis:
 
             # fall update
             if np.any(is_falling):
+                if self._vegetation is not None:
+                    # blocks leaving the slope are in the vegetation when
+                    # there is canopy above them; refresh their drag
+                    leaving = is_falling & (element_id >= 0)
+                    if np.any(leaving):
+                        (can_l,) = getSubSamples(leaving, canopy)
+                        segment_id[leaving] = self._canopyAbove(position[:, leaving], can_l)
+                        drag_samples = self._impactDrag(segment_id, drag_params)[0]
                 pos_fall, vel_fall, pro_fall, elem_fall, seg_fall, can_fall, drag_fall = getSubSamples(
                     is_falling,
                     position,

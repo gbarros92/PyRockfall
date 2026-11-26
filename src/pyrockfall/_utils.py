@@ -1662,8 +1662,13 @@ def brentq(
     converged = np.zeros(n, dtype=bool)
     iters = np.zeros(n, dtype=int)
     bracketed = fa * fb < 0.0
-    root[~bracketed] = b[~bracketed]
-    converged[~bracketed] = True
+    # Without a sign change there is no root to refine: report an end point
+    # only when it is itself a root, else NaN and not converged.
+    at_a = ~bracketed & (np.abs(fa) <= ftol)
+    at_b = ~bracketed & ~at_a & (np.abs(fb) <= ftol)
+    root[at_a] = a[at_a]
+    root[at_b] = b[at_b]
+    converged[at_a | at_b] = True
 
     # Valid initial brackets only
     valid = np.isfinite(a) & np.isfinite(b) & np.isfinite(fa) & np.isfinite(fb) & bracketed
@@ -1695,7 +1700,9 @@ def brentq(
         tol = xtol + rtol * np.abs(b)
         done = active & ((np.abs(fb) <= ftol) | (np.abs(b - a) <= tol))
         if np.any(done):
-            root[done] = np.where(fb[done] < 0, a[done], b[done])
+            # b is always the best estimate (|f(b)| <= |f(a)|); a is only the
+            # other end of the bracket, possibly far from the root.
+            root[done] = b[done]
             converged[done] = True
             iters[done] = k - 1
             active[done] = False
@@ -1703,7 +1710,7 @@ def brentq(
         if not np.any(active):
             break
 
-        s = np.empty_like(a)
+        s = b.copy()  # inactive entries stay finite (f is evaluated on all)
 
         # Inverse quadratic interpolation where possible
         iq = (
@@ -1790,7 +1797,7 @@ def brentq(
     # Final convergence check after loop
     remaining = active & ((np.abs(fb) <= ftol) | (np.abs(b - a) <= (xtol + rtol * np.abs(b))))
     if np.any(remaining):
-        root[remaining] = np.where(fb[remaining] < 0, a[remaining], b[remaining])
+        root[remaining] = b[remaining]
         converged[remaining] = True
 
     # For valid but unconverged cases, return current best estimate anyway
@@ -1798,6 +1805,40 @@ def brentq(
     root[unconverged_valid] = b[unconverged_valid]
 
     return root.reshape(shape), converged.reshape(shape), iters.reshape(shape)
+
+
+def dampedMotion(
+    v: np.ndarray,
+    a: np.ndarray,
+    damping: np.ndarray,
+    t: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Displacement and velocity after time t of the linearly damped motion
+    v' = a - damping * v, starting with velocity v.
+
+        r(t) - r(0) = v * phi1 + a * phi2
+        v(t)        = v * exp(-D t) + a * phi1
+
+    with phi1 = (1 - exp(-D t)) / D and phi2 = (t - phi1) / D. Both are
+    evaluated without the cancellation of the textbook a/D form, so they
+    tend to the parabola (phi1 -> t, phi2 -> t^2/2) as D t -> 0.
+    All inputs broadcast against each other.
+    """
+    D = np.asarray(damping, dtype=float)
+    t = np.asarray(t, dtype=float)
+    x = D * t
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        phi1 = np.where(x != 0.0, -np.expm1(-x) / np.where(D != 0.0, D, 1.0), t)
+        # (x - 1 + exp(-x)) / x^2: series for small x, closed form otherwise
+        small = np.abs(x) < 1e-3
+        g_small = 0.5 - x / 6.0 + x * x / 24.0
+        g_big = (x + np.expm1(-x)) / np.where(small, 1.0, x * x)
+        phi2 = t * t * np.where(small, g_small, g_big)
+        e = np.exp(-x)
+    disp = v * phi1 + a * phi2
+    vel = v * e + a * phi1
+    return disp, vel
 
 
 def rk4_step(

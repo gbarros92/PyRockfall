@@ -136,13 +136,50 @@ def test_brentq_matches_scipy_reference():
     assert roots[0] == pytest.approx(root_ref, abs=1e-8)
 
 
-def test_brentq_unbracketed_interval_reports_converged_with_b():
-    # Characterization: when fa*fb >= 0 (no sign change), brentq does not
-    # raise -- it just reports the interval as "converged" with root = b.
+def test_brentq_unbracketed_interval_is_not_converged():
+    # Without a sign change there is no root: NaN and not converged, unless
+    # an end point is itself a root.
     f = lambda x: np.full_like(x, 5.0)  # never crosses zero
     roots, converged, _ = brentq(f, np.array([0.0]), np.array([1.0]))
+    assert not converged[0]
+    assert np.isnan(roots[0])
+
+    g = lambda x: x - 1.0                # root at the upper end
+    roots, converged, _ = brentq(g, np.array([2.0]), np.array([1.0]), ftol=1e-12)
     assert converged[0]
     assert roots[0] == pytest.approx(1.0)
+
+
+def test_brentq_returns_the_root_not_the_far_end_of_the_bracket():
+    # Converging on |f(b)| <= ftol with f(b) < 0 used to return a, the other
+    # end of the bracket: here 0.0 instead of the root near 0.1423 (a block
+    # in vegetation then "landed" 0.13 m above the slope).
+    p = np.array([6.515, 18.742]); v = np.array([1.0, -14.86]); acc = np.array([0.0, -9.81])
+    A = np.array([0.0, 20.0]); n = np.array([20.0, 40.0])
+
+    def f(t):
+        e = np.exp(-t)
+        X = p[:, None] + acc[:, None] * t + (v - acc)[:, None] * (1 - e)
+        return n @ (X - A[:, None])
+
+    roots, converged, _ = brentq(f, np.array([0.0]), np.array([0.2]), xtol=1e-7, ftol=1e-7)
+    assert converged[0]
+    assert abs(f(roots)[0]) < 1e-5
+    assert roots[0] == pytest.approx(0.14230, abs=1e-4)
+
+
+def test_dampedMotion_matches_closed_form_and_parabola_limit():
+    from pyrockfall._utils import dampedMotion
+    v = np.array([1.0, -14.86]); a = np.array([0.0, -9.81]); t = 0.3
+    for D in (0.5, 1.0, 20.0):
+        e = np.exp(-D * t)
+        disp, vel = dampedMotion(v, a, D, t)
+        np.testing.assert_allclose(disp, a / D * t + (v - a / D) / D * (1 - e), rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(vel, a / D + (v - a / D) * e, rtol=1e-12, atol=1e-12)
+    for D in (0.0, 1e-12):
+        disp, vel = dampedMotion(v, a, D, t)
+        np.testing.assert_allclose(disp, v * t + 0.5 * a * t * t, rtol=1e-9)
+        np.testing.assert_allclose(vel, v + a * t, rtol=1e-9)
 
 
 # ---------------------------------------------------------------------------

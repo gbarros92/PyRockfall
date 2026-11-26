@@ -383,6 +383,31 @@ def _r_damped_reference(t, p, v, a, D):
     return p + drift * t + transient * (1.0 - np.exp(-D * t))
 
 
+def _two_polylines():
+    """Two separate horizontal polylines (e.g. two canopy runs): nodes 0-1-2 at
+    y = 2 for x in [0, 2], and nodes 3-4 at y = 1 for x in [5, 7]. Elements 0, 1,
+    2; there is no element between nodes 2 and 3."""
+    nodes = np.array([[0.0, 2.0], [1.0, 2.0], [2.0, 2.0], [5.0, 1.0], [7.0, 1.0]])
+    return pr.Geometry(nodes=nodes, elements=np.array([[0, 1], [1, 2], [3, 4]]))
+
+
+def test_intersections_use_elements_not_consecutive_nodes():
+    g = _two_polylines()
+    p = np.array([[6.0, 1.5, 3.5], [5.0, 5.0, 5.0]])   # above element 2, element 1, the gap
+    v = np.zeros((2, 3))
+    a = np.array([[0.0, 0.0, 0.0], [-9.81, -9.81, -9.81]])
+    assert g.intersectParabolaMatrix(p, v, a).shape == (3, 3)
+
+    seg, t = g.intersectParabola(p, v, a, np.full(3, -1))
+    assert seg.tolist() == [2, 1, -1]
+    assert t[0] == pytest.approx(np.sqrt(2 * 4.0 / 9.81))
+    assert t[1] == pytest.approx(np.sqrt(2 * 3.0 / 9.81))
+
+    seg_d, t_d = g.intersectDamped(p, v, a, np.full(3, 0.5), np.full(3, -1))
+    assert seg_d.tolist() == [2, 1, -1]
+    assert t_d[0] > t[0] and t_d[1] > t[1]                # drag slows the fall
+
+
 def test_intersect_damped_flat_floor_matches_independent_brentq():
     g = flat_floor_geometry()
     p = np.array([0.0, 10.0])
@@ -544,3 +569,52 @@ def test_ppf_accepts_one_row_per_coordinate_as_drawn_by_analysis():
     np.testing.assert_array_equal(g.ppf(q2), g.ppf(q3))
     with pytest.raises(ValueError, match="one per coordinate"):
         g.ppf(q2[:-1])
+
+
+# ---------------------------------------------------------------------------
+# Damped/parabola crossings used for vegetation canopies
+# ---------------------------------------------------------------------------
+
+def _damped_y_root(p, v, a, damping, y_line, t0, t1):
+    f = lambda t: _r_damped_reference(t, p, v, a, damping)[1] - y_line
+    return brentq(f, t0, t1, xtol=1e-12)
+
+
+def test_intersect_damped_from_the_line_it_leaves_finds_the_landing():
+    # A block bouncing up off a flat element sits on its support line at
+    # t = 0; that root used to be taken (and dropped), losing the landing.
+    g = flat_floor_geometry()
+    p = np.array([0.0, 0.0]); v = np.array([3.0, 4.0]); a = np.array([0.0, -9.81]); D = 1.0
+    t_ref = _damped_y_root(p, v, a, D, 0.0, 0.1, 5.0)
+
+    seg, t = g.intersectDamped(p.reshape(2, 1), v.reshape(2, 1), a.reshape(2, 1), np.array([D]), np.array([0]), tol=1e-7)
+    assert seg[0] == 0
+    assert t[0] == pytest.approx(t_ref, rel=1e-6)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_intersect_damped_finds_the_up_crossing_before_the_down_one(reverse):
+    # Launched up through a line 2 m above, the damped path crosses it twice.
+    # Bracketing up to the parabola's down crossing held both crossings and
+    # found neither, for lines drawn left to right.
+    nodes = np.array([[-50.0, 2.0], [50.0, 2.0]])
+    g = pr.Geometry(nodes=nodes[::-1] if reverse else nodes)
+    p = np.array([0.0, 0.0]); v = np.array([2.0, 12.0]); a = np.array([0.0, -9.81]); D = 1.0
+    t_up = _damped_y_root(p, v, a, D, 2.0, 0.0, 0.5)
+
+    seg, t = g.intersectDamped(p.reshape(2, 1), v.reshape(2, 1), a.reshape(2, 1), np.array([D]), np.array([-1]), tol=1e-7)
+    assert seg[0] == 0
+    assert t[0] == pytest.approx(t_up, rel=1e-6)
+
+
+def test_intersect_parabola_any_crossing_ignores_line_direction():
+    # "entering" picks the crossing against the element normal, so a line
+    # drawn right to left (normal down) is missed from above; "any" finds
+    # the first crossing either way.
+    g = pr.Geometry(nodes=np.array([[50.0, 2.0], [-50.0, 2.0]]))
+    p = np.array([[0.0], [5.0]]); v = np.array([[1.0], [0.0]]); a = np.array([[0.0], [-9.81]])
+    seg, t = g.intersectParabola(p, v, a, np.array([-1]), crossing="any")
+    assert seg[0] == 0
+    assert t[0] == pytest.approx(np.sqrt(2 * 3.0 / 9.81))
+    seg_e, _ = g.intersectParabola(p, v, a, np.array([-1]))
+    assert seg_e[0] == -1

@@ -896,3 +896,163 @@ def test_sample_normals_rejects_mismatched_samples():
     normals = np.zeros((2, 3, 5))
     with pytest.raises(ValueError, match="1 or S=3"):
         sampleNormals(np.zeros((2, 3)), np.array([0, 1, 2]), normals)
+
+
+def test_slide_from_end_node_changes_element_instead_of_overshooting():
+    # A block sitting exactly on the end node it slides towards has exit
+    # time 0. It must move on to the next element; it used to keep its
+    # element and slide on along that element's extension (through the
+    # rock at a V-notch, through the air past a convex corner).
+    nodes = np.array([[0.0, 10.0], [10.0, 0.0], [20.0, -1.0]])
+    slope = pr.Slope(pr.Geometry(nodes=nodes), materials=pr.Material(name="A"))
+    a = make_analysis(slope=slope)
+    a._ndim = 2
+    a.gravity = -10.0
+    a.timeStep = 0.01
+    a.stoppedVelocity = 1e-5
+
+    normal = np.array([[1.0], [1.0]]) / np.sqrt(2)
+    pos = np.array([[10.0], [0.0]])                  # on node 1, the end of element 0
+    vt = np.array([[2.0], [-2.0]])                   # sliding down element 0
+    profiles = slope.nodes.T[:, :, None]
+
+    pos2, vt2, a0, dt, elem2 = a._slide(pos, vt, normal, np.array([0.0]), profiles, np.array([0]))
+
+    assert elem2[0] == 1
+    np.testing.assert_allclose(pos2[:, 0], [10.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(vt2[:, 0], [2.0, -2.0], atol=1e-12)   # no time elapsed
+    assert dt[0] == pytest.approx(0.0)
+
+
+def test_run_blocks_stop_at_the_bottom_of_a_steep_v_notch():
+    # A notch taken from a field profile: an almost vertical wall down to
+    # node 5, then a 57 degree wall up. Blocks sliding into the bottom used
+    # to slide on along the far wall's extension, through the rock, and
+    # never stop (190 of 200 here). They must stop at the bottom node,
+    # without cycling between the two walls until maxIter.
+    nodes = np.array([
+        [-8.62, 9.044], [-8.461, 8.631], [-8.277, 8.133], [-8.126, 7.651], [-7.978, 7.093],
+        [-7.951, 6.415], [-6.931, 8.004], [-6.416, 7.946], [-5.834, 7.375], [5.0, 7.375],
+    ])
+    material = pr.Material(name="A", normalRestitution=0.3, tangentialRestitution=0.82, frictionAngle=35.0)
+    slope = pr.Slope(pr.Geometry(nodes=nodes), materials=material)
+
+    rock = pr.Rock(name="R", mass=1000.0, density=2700.0)
+    seeder = pr.LineSeeder(points=(nodes[:6] + [0.05, 0.05]).T, rocks=[rock])
+    seeder.numberOfRocks = 50
+    seeder.translationalVelocity = [0.0, -3.13]
+    seeder.angularVelocity = [0.0]
+
+    a = Analysis()
+    a.seeders = [seeder]
+    a.slope = slope
+    a.samplingMethod = Sampling.LatinHypercube
+    a.useSpecificSeed = True
+    a.specificSeed = 1
+    a.maxIter = 1000
+
+    a.run()
+
+    P = a.trajectories._position_history
+    assert P.shape[0] < 200                                  # stopped on its own
+    assert P[:, 1, :].min() >= nodes[5, 1] - 1e-6            # never below the notch
+    in_notch = np.isclose(P[-1, 0], nodes[5, 0], atol=1e-6) & np.isclose(P[-1, 1], nodes[5, 1], atol=1e-6)
+    assert in_notch.sum() > 0
+
+
+def test_isSliding_needs_more_than_the_stopped_velocity_per_step():
+    # A block at rest starts sliding only when the net tangential
+    # acceleration gains more than stoppedVelocity in one step: below that
+    # _slide zeroes its speed every step, so counting it as sliding kept
+    # the run going until maxIter with the block standing still.
+    a = make_analysis()
+    a._ndim = 2
+    a.gravity = -10.0
+    a.timeStep = 0.01
+    a.stoppedVelocity = 1e-3
+    phi = 30.0
+    mu = np.tan(np.radians(phi))
+
+    def net_acc(theta):
+        return 10.0 * (np.sin(theta) - mu * np.cos(theta))
+
+    # angles with net accelerations of about 0.05 and 1.0 m/s^2
+    thetas = [np.radians(phi) + d for d in (0.05 / (10.0 / np.cos(np.radians(phi))), 1.0 / (10.0 / np.cos(np.radians(phi))))]
+    assert net_acc(thetas[0]) * a.timeStep < a.stoppedVelocity < net_acc(thetas[1]) * a.timeStep
+    normals = np.array([[np.sin(t) for t in thetas], [np.cos(t) for t in thetas]])
+    vt = np.zeros((2, 2))
+    np.testing.assert_array_equal(a._isSliding(vt, normals, np.array([phi, phi])), [False, True])
+
+
+# ---------------------------------------------------------------------------
+# Vegetation: parabola down to the canopy, damped motion below it
+# ---------------------------------------------------------------------------
+
+def _canopy_analysis(slope_nodes, canopy_nodes, drag=1.0):
+    slope = pr.Slope(pr.Geometry(nodes=slope_nodes), materials=pr.Material(name="A"))
+    veg = pr.Vegetation(pr.Geometry(nodes=canopy_nodes), drag=[pr.Drag(name="v", coefficient=drag)], identities=np.array([0]))
+    a = make_analysis(slope=slope)
+    a.vegetation = veg
+    a._ndim = 2
+    a.gravity = -9.81
+    a.tolerance = 1e-7
+    return a, slope_nodes.T[:, :, None], canopy_nodes.T[:, :, None]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_fall_crossing_the_canopy_enters_or_leaves_it_in_the_air(reverse):
+    floor = np.array([[0.0, 0.0], [40.0, 0.0]])
+    canopy = np.array([[0.0, 2.0], [40.0, 2.0]])
+    a, pro, can = _canopy_analysis(floor, canopy[::-1] if reverse else canopy)
+    # 0: bounced off element 0 into the air above the canopy, falling onto it
+    # 1: in the vegetation, launched up hard: leaves through the canopy
+    pos = np.array([[10.0, 10.0], [5.0, 0.0]])
+    vel = np.array([[2.0, 2.0], [-1.0, 12.0]])
+    out_pos, out_vel, dt, elm, seg = a._fall(
+        pos.copy(), vel.copy(), pro, np.array([0, 0]), np.array([-1, 0]),
+        canopy=can, drag_params=np.array([np.nan, 1.0]),
+    )
+    np.testing.assert_allclose(out_pos[1], [2.0, 2.0], atol=1e-6)   # both stop on the canopy line
+    assert elm.tolist() == [-1, -1]          # in the air, not on the element they left
+    assert seg.tolist() == [0, -1]           # 0 entered the vegetation, 1 left it
+    g2 = 9.81 / 2
+    assert dt[0] == pytest.approx((-1.0 + np.sqrt(1.0 + 4 * g2 * 3.0)) / (2 * g2))   # 3 m down, starting at -1 m/s
+
+
+def test_run_through_canopy_has_impacts_only_on_the_slope():
+    # A block bounces on open slope, flies into the canopy and goes on with
+    # drag to the slope. Crossing the canopy used to keep the element it had
+    # left, so the next step "impacted" that element at the canopy and the
+    # block bounced off the canopy.
+    nodes = np.array([[0.0, 20.0], [40.0, 0.0], [80.0, 0.0]])
+    canopy = np.array([[15.0, 14.5], [38.0, 3.0]])
+    material = pr.Material(name="A", normalRestitution=0.8, tangentialRestitution=0.8, frictionAngle=30.0)
+    slope = pr.Slope(pr.Geometry(nodes=nodes), materials=material)
+    veg = pr.Vegetation(pr.Geometry(nodes=canopy), drag=[pr.Drag(name="v", coefficient=1.0)], identities=np.array([0]))
+
+    rock = pr.Rock(name="R", mass=1000.0, density=2700.0)
+    seeder = pr.Seeder(points=np.array([2.0, 30.0]), rocks=[rock])
+    seeder.numberOfRocks = 1
+    seeder.translationalVelocity = [3.0, 0.0]
+    seeder.angularVelocity = [0.0]
+
+    a = Analysis()
+    a.seeders = [seeder]
+    a.slope = slope
+    a.vegetation = veg
+    a.samplingMethod = Sampling.MonteCarlo
+    a.useSpecificSeed = True
+    a.specificSeed = 1
+    a.maxIter = 200
+    a.run()
+
+    P = a.trajectories._position_history[:, :, 0]
+    y_slope = np.interp(P[:, 0], nodes[:, 0], nodes[:, 1])
+    on_canopy = np.isclose(P[:, 1], np.interp(P[:, 0], canopy[:, 0], canopy[:, 1]), atol=1e-6) & (P[:, 0] > 15) & (P[:, 0] < 38)
+    assert on_canopy.any()                                        # it did cross the canopy
+
+    imp = np.array([np.asarray(x)[:, 0] for x in a.impacts._position_history])
+    imp = imp[np.isfinite(imp[:, 0])]
+    assert len(imp) > 1
+    np.testing.assert_allclose(imp[:, 1], np.interp(imp[:, 0], nodes[:, 0], nodes[:, 1]), atol=1e-6)
+    assert np.all(P[:, 1] >= y_slope - 1e-6)                      # and never went below the slope
